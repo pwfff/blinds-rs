@@ -1,0 +1,18 @@
+{
+    "rust-analyzer.procMacro.enable": false,
+    "rust-analyzer.cargo.extraEnv": {
+        "CROSS_COMPILE": "xtensa-esp32-elf"
+    },
+    "terminal.integrated.env.linux": {
+        "PATH": "/home/pwf/.rustup/toolchains/esp/xtensa-esp32s2-elf/esp-12.2.0_20230208/xtensa-esp32s2-elf/bin:/home/pwf/.rustup/toolchains/esp/xtensa-esp32s3-elf/esp-12.2.0_20230208/xtensa-esp32s3-elf/bin:/home/pwf/.rustup/toolchains/esp/xtensa-esp32-elf/esp-12.2.0_20230208/xtensa-esp32-elf/bin:/home/pwf/.rustup/toolchains/esp/riscv32-esp-elf/esp-12.2.0_20230208/riscv32-esp-elf/bin:$PATH"
+    },
+    "files.associations": {
+        "linearramp.h": "c"
+    },
+    "rust-analyzer.cargo.target": "xtensa-esp32s3-none-elf",
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.check.extraArgs": [
+        "--target",
+        "xtensa-esp32s3-none-elf"
+    ]
+}
