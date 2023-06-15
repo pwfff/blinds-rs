@@ -1,25 +1,53 @@
 #![no_std]
 #![no_main]
 
-use core::mem::transmute;
+use core::{fmt::Debug, mem::transmute};
 
 use esp_backtrace as _;
 use esp_println::println;
+use fugit::MicrosDurationU32;
 use hal::{
     clock::ClockControl,
-    peripherals::Peripherals,
+    gpio::{Gpio17, Gpio18, Output, PushPull, IO},
+    interrupt,
+    ledc::{
+        channel::{self, ChannelIFace},
+        timer::{self, TimerIFace},
+        LSGlobalClkSource, LowSpeed, LEDC,
+    },
+    peripherals::{self, Peripherals},
     prelude::*,
     spi::{FullDuplexMode, SpiMode},
-    systimer::SystemTimer,
+    systimer::{Alarm, Periodic, SystemTimer},
     timer::TimerGroup,
-    Rtc, Spi, IO,
+    Delay, Priority, Rtc, Spi,
 };
 use tmc_rs::{
-    periodic, tmc2240_defaultRegisterResetState, tmc_ramp_linear_init, ConfigState_CONFIG_RESTORE,
-    ConfigurationTypeDef, TMC_LinearRamp, TMC2240_REGISTER_COUNT, 
+    periodic, tmc2240_defaultRegisterResetState, tmc2240_reset, tmc_ramp_linear_init,
+    ConfigState_CONFIG_RESTORE, ConfigurationTypeDef, GStat, SPIStatus, TMC_LinearRamp,
+    TMC2240_CHOPCONF, TMC2240_EN_PWM_MODE_MASK, TMC2240_EN_PWM_MODE_SHIFT, TMC2240_GCONF,
+    TMC2240_GSTAT, TMC2240_HEND_OFFSET_MASK, TMC2240_HEND_OFFSET_SHIFT, TMC2240_HSTRT_TFD210_MASK,
+    TMC2240_HSTRT_TFD210_SHIFT, TMC2240_IOIN, TMC2240_PWMCONF, TMC2240_PWM_AUTOGRAD_MASK,
+    TMC2240_PWM_AUTOGRAD_SHIFT, TMC2240_PWM_AUTOSCALE_MASK, TMC2240_PWM_AUTOSCALE_SHIFT,
+    TMC2240_PWM_FREQ_MASK, TMC2240_PWM_FREQ_SHIFT, TMC2240_PWM_MEAS_SD_ENABLE_MASK,
+    TMC2240_PWM_MEAS_SD_ENABLE_SHIFT, TMC2240_REGISTER_COUNT, TMC2240_TBL_MASK, TMC2240_TBL_SHIFT,
+    TMC2240_TOFF_MASK, TMC2240_TOFF_SHIFT, TMC2240_XENC, TMC_ADDRESS_MASK, TMC_REGISTER_COUNT,
+    TMC_WRITE_BIT,
 };
 
-static mut SPI: Option<Spi<hal::peripherals::SPI2, FullDuplexMode>> = None;
+use core::cell::RefCell;
+
+use critical_section::Mutex;
+
+static SPI: Mutex<RefCell<Option<Spi<hal::peripherals::SPI2, FullDuplexMode>>>> =
+    Mutex::new(RefCell::new(None));
+
+// static STEP: Mutex<RefCell<Option<Timer<Timer0<TIMG0>>>>> = Mutex::new(RefCell::new(None));
+
+static ALARM0: Mutex<RefCell<Option<Alarm<Periodic, 0>>>> = Mutex::new(RefCell::new(None));
+
+static STEP: Mutex<RefCell<Option<Gpio17<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
+static DIR: Mutex<RefCell<Option<Gpio18<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
@@ -46,12 +74,12 @@ fn main() -> ! {
     wdt1.disable();
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let mosi = io.pins.gpio5;
-    let sclk = io.pins.gpio6;
-    let cs = io.pins.gpio7;
-    let miso = io.pins.gpio8;
+    let mosi = io.pins.gpio4;
+    let sclk = io.pins.gpio5;
+    let cs = io.pins.gpio6;
+    let miso = io.pins.gpio7;
     let mut en = io.pins.gpio15.into_push_pull_output();
-    en.set_low().unwrap();
+    en.set_low().log().unwrap();
 
     let spi = Spi::new(
         peripherals.SPI2,
@@ -59,16 +87,83 @@ fn main() -> ! {
         mosi,
         miso,
         cs,
-        5u32.MHz(),
-        SpiMode::Mode0,
+        5000u32.kHz(),
+        SpiMode::Mode3,
         &mut system.peripheral_clock_control,
         &clocks,
     );
 
-    let timer = SystemTimer::now();
+    let clk = io.pins.gpio16.into_push_pull_output();
+    let step = io.pins.gpio17.into_push_pull_output();
+    let mut dir = io.pins.gpio18.into_push_pull_output();
+    dir.set_low().unwrap();
+
+    let mut ledc = LEDC::new(
+        peripherals.LEDC,
+        &clocks,
+        &mut system.peripheral_clock_control,
+    );
+
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+
+    let mut lstimer0 = ledc.get_timer::<LowSpeed>(timer::Number::Timer0);
+
+    lstimer0
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty1Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: 16u32.MHz(),
+        })
+        .log()
+        .unwrap();
+
+    let mut channel0 = ledc.get_channel(channel::Number::Channel0, clk);
+    channel0
+        .configure(channel::config::Config {
+            timer: &lstimer0,
+            duty_pct: 50,
+            pin_config: channel::config::PinConfig::PushPull,
+        })
+        .log()
+        .unwrap();
+
+    //let mut ramp = TMC_LinearRamp {
+    //    maxVelocity: 0,
+    //    targetPosition: 0,
+    //    rampPosition: 0,
+    //    targetVelocity: 0,
+    //    rampVelocity: 0,
+    //    acceleration: 0,
+    //    rampEnabled: true,
+    //    accumulatorVelocity: 0,
+    //    accumulatorPosition: 0,
+    //    rampMode: 0,
+    //    state: 0,
+    //    accelerationSteps: 0,
+    //    precision: 0,
+    //    homingDistance: 0,
+    //    stopVelocity: 0,
+    //};
+    // tmc_ramp_linear_init(&mut ramp);
+
+    let t_step = MicrosDurationU32::micros(10000);
+    let f_step = t_step.into_rate();
+    println!("t_step {} f_step {}", t_step, f_step);
+
+    let timer = SystemTimer::new(peripherals.SYSTIMER);
+    let alarm = timer.alarm0.into_periodic();
+    alarm.set_period(f_step);
+    alarm.clear_interrupt();
+    alarm.interrupt_enable(true);
+
+    critical_section::with(|cs| {
+        SPI.borrow_ref_mut(cs).replace(spi);
+        ALARM0.borrow_ref_mut(cs).replace(alarm);
+        STEP.borrow_ref_mut(cs).replace(step);
+        DIR.borrow_ref_mut(cs).replace(dir);
+    });
 
     unsafe {
-        SPI = Some(spi);
         tmc_rs::SPIWriter = Some(write_spi);
     }
 
@@ -81,46 +176,245 @@ fn main() -> ! {
         callback: None,
         channel: 0,
     };
-    let register_reset_state: [i32; TMC2240_REGISTER_COUNT as usize] = unsafe { transmute(tmc2240_defaultRegisterResetState.clone())};
+    let mut register_reset_state: [u32; TMC2240_REGISTER_COUNT as usize] =
+        tmc2240_defaultRegisterResetState.clone();
+
+    // enable PWM mode in general conf
+    set_field(
+        &mut register_reset_state,
+        TMC2240_GCONF,
+        TMC2240_EN_PWM_MODE_MASK,
+        TMC2240_EN_PWM_MODE_SHIFT,
+        1,
+    );
+
+    // enable autograd, autoscale, current measurement
+    set_field(
+        &mut register_reset_state,
+        TMC2240_PWMCONF,
+        TMC2240_PWM_AUTOGRAD_MASK,
+        TMC2240_PWM_AUTOGRAD_SHIFT,
+        1,
+    );
+    set_field(
+        &mut register_reset_state,
+        TMC2240_PWMCONF,
+        TMC2240_PWM_AUTOSCALE_MASK,
+        TMC2240_PWM_AUTOSCALE_SHIFT,
+        1,
+    );
+    set_field(
+        &mut register_reset_state,
+        TMC2240_PWMCONF,
+        TMC2240_PWM_MEAS_SD_ENABLE_MASK,
+        TMC2240_PWM_MEAS_SD_ENABLE_SHIFT,
+        1,
+    );
+
+    // default 0 recommended for 16MHz clk
+    set_field(
+        &mut register_reset_state,
+        TMC2240_PWMCONF,
+        TMC2240_PWM_FREQ_MASK,
+        TMC2240_PWM_FREQ_SHIFT,
+        0,
+    );
+
+    // configure CHOPCONF - not used, but must be configured to run the motor
+    set_field(
+        &mut register_reset_state,
+        TMC2240_CHOPCONF,
+        TMC2240_TOFF_MASK,
+        TMC2240_TOFF_SHIFT,
+        3,
+    );
+    set_field(
+        &mut register_reset_state,
+        TMC2240_CHOPCONF,
+        TMC2240_TBL_MASK,
+        TMC2240_TBL_SHIFT,
+        2,
+    );
+    set_field(
+        &mut register_reset_state,
+        TMC2240_CHOPCONF,
+        TMC2240_HSTRT_TFD210_MASK,
+        TMC2240_HSTRT_TFD210_SHIFT,
+        4,
+    );
+    set_field(
+        &mut register_reset_state,
+        TMC2240_CHOPCONF,
+        TMC2240_HEND_OFFSET_MASK,
+        TMC2240_HEND_OFFSET_SHIFT,
+        0,
+    );
+
+    let register_reset_state = unsafe { transmute(register_reset_state) };
     let mut mcu = tmc_rs::new(0, config, &register_reset_state, None);
 
-    println!("Hello world!");
+    println!("resetting mcu");
+    unsafe { tmc2240_reset(&mut mcu) };
 
-    let mut ramp = TMC_LinearRamp {
-        maxVelocity: 0,
-        targetPosition: 0,
-        rampPosition: 0,
-        targetVelocity: 0,
-        rampVelocity: 0,
-        acceleration: 0,
-        rampEnabled: true,
-        accumulatorVelocity: 0,
-        accumulatorPosition: 0,
-        rampMode: 0,
-        state: 0,
-        accelerationSteps: 0,
-        precision: 0,
-        homingDistance: 0,
-        stopVelocity: 0,
-    };
+    // clear status flags, check GSTAT
+
+    write_spi_bytes(TMC2240_GSTAT as u8, [255; 4]);
+    let stat = GStat::from(read_spi(TMC2240_GSTAT as u8)[4]);
+    println!("gstat {:?}", stat);
+
+    interrupt::enable(
+        peripherals::Interrupt::SYSTIMER_TARGET0,
+        Priority::Priority1,
+    )
+    .log()
+    .unwrap();
+
+    let mut delay = Delay::new(&clocks);
 
     loop {
+        // wait for register writes
         unsafe {
-            // wait for register writes
             while (*mcu.config).state > 0 {
                 periodic(&mut mcu, SystemTimer::now() as u32);
                 continue;
             }
-
-            tmc_ramp_linear_init(&mut ramp);
         }
+
+        delay.delay_ms(1000u32);
+
+        let resp = read_spi(TMC2240_XENC as u8);
+        let x_enc = i32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]);
+        println!("{:?}", x_enc);
+
+        // let resp = critical_section::with(|cs| {
+        //     let mut spi = SPI.borrow_ref_mut(cs);
+        //     let spi = spi.as_mut().unwrap();
+
+        //     spi.transfer(&mut [0, 1, 2, 3, 4]).log().unwrap();
+        //     let mut msg = [0, 1, 2, 3, 4];
+        //     let resp = spi.transfer(&mut msg).log().unwrap();
+        //     println!("{:x?}", resp);
+        //     resp[0]
+        // });
+
+        // let status = SPIStatus::from(resp);
+        // println!("{:#?}", status);
+
+        let resp = read_spi(TMC2240_GSTAT as u8);
+        let gstat = GStat::from(resp[4]);
+        println!("{:#?}", gstat);
     }
+}
+
+fn write_spi_bytes(address: u8, value: [u8; 4]) {
+    let mut data: [u8; 5] = [
+        // set write bit
+        address | 0b10000000,
+        value[0],
+        value[1],
+        value[2],
+        value[3],
+    ];
+
+    critical_section::with(|cs| {
+        let mut spi = SPI.borrow_ref_mut(cs);
+        let spi = spi.as_mut().unwrap();
+
+        println!("writing to spi: {:x?}", data);
+
+        spi.transfer(&mut data[..])
+            .expect("Symmetric transfer failed");
+
+        println!("wrote to spi, got {:x?}", data);
+        println!("spi status: {:?}", SPIStatus::from(data[0]));
+    })
 }
 
 fn write_spi(address: u8, value: i32) {
     let value_bytes = value.to_be_bytes();
-    let data: [u8; 4] = [address, value_bytes[0], value_bytes[1], value_bytes[2]];
+    let mut data: [u8; 5] = [
+        // set write bit
+        address | (TMC_WRITE_BIT as u8),
+        value_bytes[0],
+        value_bytes[1],
+        value_bytes[2],
+        value_bytes[3],
+    ];
 
-    let spi = unsafe { SPI.as_mut().unwrap() };
-    spi.write(&data);
+    critical_section::with(|cs| {
+        let mut spi = SPI.borrow_ref_mut(cs);
+        let spi = spi.as_mut().unwrap();
+
+        println!("writing to spi: {:x?}", data);
+
+        spi.transfer(&mut data[..])
+            .expect("Symmetric transfer failed");
+
+        println!("wrote to spi, got {:x?}", data);
+        println!("spi status: {:?}", SPIStatus::from(data[0]));
+    })
+}
+
+fn read_spi(address: u8) -> [u8; 5] {
+    critical_section::with(|cs| {
+        let mut spi = SPI.borrow_ref_mut(cs);
+        let spi = spi.as_mut().unwrap();
+
+        let mut data = [address as u8 & 0b01111111, 0, 0, 0, 0];
+        spi.transfer(&mut data[..])
+            .expect("Symmetric transfer failed");
+        println!("reading from SPI, last response {:x?}", data);
+        println!("spi status: {:?}", SPIStatus::from(data[0]));
+
+        let mut data = [address as u8 & 0b01111111, 0, 0, 0, 0];
+        spi.transfer(&mut data[..])
+            .expect("Symmetric transfer failed");
+        println!("read from SPI, actual response {:x?}", data);
+        println!("spi status: {:?}", SPIStatus::from(data[0]));
+
+        data
+    })
+}
+
+fn set_field(
+    reg: &mut [u32; TMC_REGISTER_COUNT as usize],
+    addr: u32,
+    mask: u32,
+    shift: u32,
+    value: u32,
+) {
+    let addr = addr & TMC_ADDRESS_MASK;
+
+    let old_value = reg[addr as usize];
+    let cleared = (old_value) & (!(mask));
+    let new_value = ((value << shift) & mask) as u32;
+    reg[addr as usize] = cleared | new_value;
+}
+
+trait LogExt {
+    fn log(self) -> Self;
+}
+
+impl<T, E: Debug> LogExt for Result<T, E> {
+    fn log(self) -> Self {
+        if let Err(e) = &self {
+            println!("An error happened: {:?}", e);
+        }
+        self
+    }
+}
+
+#[interrupt]
+fn SYSTIMER_TARGET0() {
+    critical_section::with(|cs| {
+        let mut step = STEP.borrow_ref_mut(cs);
+        let step = step.as_mut().unwrap();
+        step.toggle().log().unwrap();
+
+        ALARM0
+            .borrow_ref_mut(cs)
+            .as_mut()
+            .unwrap()
+            .clear_interrupt();
+    });
 }

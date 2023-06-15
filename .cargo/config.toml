@@ -1,5 +1,5 @@
 [target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor --port /dev/ttyACM1"
+runner = "espflash flash --monitor --port /dev/ttyACM0"
 
 [build]
 rustflags = [

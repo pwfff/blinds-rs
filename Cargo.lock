@@ -151,9 +151,12 @@ checksum = "6776fc96284a0bb647b615056fc496d1fe1644a7ab01829818a6d91cae888b84"
 name = "blinds_rs"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
+ "embedded-hal 1.0.0-alpha.10",
  "esp-backtrace",
  "esp-println",
  "esp32s3-hal",
+ "fugit",
  "tmc-rs",
 ]
 
@@ -384,6 +387,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-hal"
+version = "1.0.0-alpha.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f65c4d073f5d91c66e629b216818a4c9747eeda0debedf2deda9a0a947e4e93b"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,7 +454,7 @@ dependencies = [
  "cfg-if",
  "critical-section",
  "embedded-dma",
- "embedded-hal",
+ "embedded-hal 0.2.7",
  "esp-hal-procmacros",
  "esp-synopsys-usb-otg",
  "esp32s3",
@@ -491,7 +500,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0879f2f008c0213b1a5959345e54afcbf1490c1591f5145a5e65bdff371b65af"
 dependencies = [
  "critical-section",
- "embedded-hal",
+ "embedded-hal 0.2.7",
  "usb-device",
  "vcell",
 ]
@@ -514,7 +523,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "552c3669d592a96479b2a526268e7b29421888defd08029c7bdc3c0c77cdee7c"
 dependencies = [
  "bare-metal",
- "embedded-hal",
+ "embedded-hal 0.2.7",
  "esp-hal-common",
 ]
 
@@ -2096,7 +2105,7 @@ dependencies = [
  "quote",
  "r3bl_rs_utils",
  "regex",
- "syn 1.0.109",
+ "syn 2.0.18",
 ]
 
 [[package]]
