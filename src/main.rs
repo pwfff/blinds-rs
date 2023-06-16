@@ -25,14 +25,20 @@ use hal::{
 use tmc_rs::{
     periodic, tmc2240_defaultRegisterResetState, tmc2240_reset, tmc_ramp_linear_init,
     ConfigState_CONFIG_RESTORE, ConfigurationTypeDef, GStat, SPIStatus, TMC_LinearRamp,
-    TMC2240_CHOPCONF, TMC2240_EN_PWM_MODE_MASK, TMC2240_EN_PWM_MODE_SHIFT, TMC2240_GCONF,
-    TMC2240_GSTAT, TMC2240_HEND_OFFSET_MASK, TMC2240_HEND_OFFSET_SHIFT, TMC2240_HSTRT_TFD210_MASK,
-    TMC2240_HSTRT_TFD210_SHIFT, TMC2240_IOIN, TMC2240_PWMCONF, TMC2240_PWM_AUTOGRAD_MASK,
+    TMC2240_CHOPCONF, TMC2240_CS_ACTUAL_MASK, TMC2240_CS_ACTUAL_SHIFT, TMC2240_DRVSTATUS,
+    TMC2240_EN_PWM_MODE_MASK, TMC2240_EN_PWM_MODE_SHIFT, TMC2240_FSACTIVE_MASK,
+    TMC2240_FSACTIVE_SHIFT, TMC2240_GCONF, TMC2240_GSTAT, TMC2240_HEND_OFFSET_MASK,
+    TMC2240_HEND_OFFSET_SHIFT, TMC2240_HSTRT_TFD210_MASK, TMC2240_HSTRT_TFD210_SHIFT,
+    TMC2240_INTPOL_MASK, TMC2240_INTPOL_SHIFT, TMC2240_IOIN, TMC2240_MRES_MASK, TMC2240_MRES_SHIFT,
+    TMC2240_MSCNT, TMC2240_OLA_MASK, TMC2240_OLA_SHIFT, TMC2240_OTPW_MASK, TMC2240_OTPW_SHIFT,
+    TMC2240_OT_MASK, TMC2240_OT_SHIFT, TMC2240_PWMCONF, TMC2240_PWM_AUTOGRAD_MASK,
     TMC2240_PWM_AUTOGRAD_SHIFT, TMC2240_PWM_AUTOSCALE_MASK, TMC2240_PWM_AUTOSCALE_SHIFT,
     TMC2240_PWM_FREQ_MASK, TMC2240_PWM_FREQ_SHIFT, TMC2240_PWM_MEAS_SD_ENABLE_MASK,
-    TMC2240_PWM_MEAS_SD_ENABLE_SHIFT, TMC2240_REGISTER_COUNT, TMC2240_TBL_MASK, TMC2240_TBL_SHIFT,
-    TMC2240_TOFF_MASK, TMC2240_TOFF_SHIFT, TMC2240_XENC, TMC_ADDRESS_MASK, TMC_REGISTER_COUNT,
-    TMC_WRITE_BIT,
+    TMC2240_PWM_MEAS_SD_ENABLE_SHIFT, TMC2240_REGISTER_COUNT, TMC2240_S2GA_MASK,
+    TMC2240_S2GA_SHIFT, TMC2240_S2GB_MASK, TMC2240_S2GB_SHIFT, TMC2240_S2VSA_MASK,
+    TMC2240_S2VSA_SHIFT, TMC2240_S2VSB_MASK, TMC2240_S2VSB_SHIFT, TMC2240_STEALTH_MASK,
+    TMC2240_STEALTH_SHIFT, TMC2240_TBL_MASK, TMC2240_TBL_SHIFT, TMC2240_TOFF_MASK,
+    TMC2240_TOFF_SHIFT, TMC2240_XENC, TMC_ADDRESS_MASK, TMC_REGISTER_COUNT, TMC_WRITE_BIT, TMC2240_IHOLD_IRUN, TMC2240_IRUN_MASK, TMC2240_IRUN_SHIFT,
 };
 
 use core::cell::RefCell;
@@ -79,7 +85,7 @@ fn main() -> ! {
     let cs = io.pins.gpio6;
     let miso = io.pins.gpio7;
     let mut en = io.pins.gpio15.into_push_pull_output();
-    en.set_low().log().unwrap();
+    en.set_high().log().unwrap();
 
     let spi = Spi::new(
         peripherals.SPI2,
@@ -146,7 +152,7 @@ fn main() -> ! {
     //};
     // tmc_ramp_linear_init(&mut ramp);
 
-    let t_step = MicrosDurationU32::micros(10000);
+    let t_step = MicrosDurationU32::millis(4);
     let f_step = t_step.into_rate();
     println!("t_step {} f_step {}", t_step, f_step);
 
@@ -178,6 +184,14 @@ fn main() -> ! {
     };
     let mut register_reset_state: [u32; TMC2240_REGISTER_COUNT as usize] =
         tmc2240_defaultRegisterResetState.clone();
+
+    set_field(
+        &mut register_reset_state,
+        TMC2240_IHOLD_IRUN,
+        TMC2240_IRUN_MASK,
+        TMC2240_IRUN_SHIFT,
+        28,
+    );
 
     // enable PWM mode in general conf
     set_field(
@@ -218,6 +232,21 @@ fn main() -> ! {
         TMC2240_PWM_FREQ_MASK,
         TMC2240_PWM_FREQ_SHIFT,
         0,
+    );
+
+    set_field(
+        &mut register_reset_state,
+        TMC2240_CHOPCONF,
+        TMC2240_MRES_MASK,
+        TMC2240_MRES_SHIFT,
+        8,
+    );
+    set_field(
+        &mut register_reset_state,
+        TMC2240_CHOPCONF,
+        TMC2240_INTPOL_MASK,
+        TMC2240_INTPOL_SHIFT,
+        1,
     );
 
     // configure CHOPCONF - not used, but must be configured to run the motor
@@ -269,6 +298,8 @@ fn main() -> ! {
     .log()
     .unwrap();
 
+    en.set_low().unwrap();
+
     let mut delay = Delay::new(&clocks);
 
     loop {
@@ -282,9 +313,11 @@ fn main() -> ! {
 
         delay.delay_ms(1000u32);
 
-        let resp = read_spi(TMC2240_XENC as u8);
-        let x_enc = i32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]);
-        println!("{:?}", x_enc);
+        let resp = read_spi(TMC2240_MSCNT as u8);
+        println!("mscnt {:?}", resp[4]);
+
+        let resp = read_spi(TMC2240_CHOPCONF as u8);
+        println!("chopconf[4] {:b}", resp[4]);
 
         // let resp = critical_section::with(|cs| {
         //     let mut spi = SPI.borrow_ref_mut(cs);
@@ -300,9 +333,59 @@ fn main() -> ! {
         // let status = SPIStatus::from(resp);
         // println!("{:#?}", status);
 
-        let resp = read_spi(TMC2240_GSTAT as u8);
-        let gstat = GStat::from(resp[4]);
-        println!("{:#?}", gstat);
+        let resp = read_spi(TMC2240_DRVSTATUS as u8);
+        let stat = u32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]);
+        println!(
+            "ola {}",
+            read_field(stat, TMC2240_OLA_MASK, TMC2240_OLA_SHIFT)
+        );
+        println!(
+            "s2gb {}",
+            read_field(stat, TMC2240_S2GB_MASK, TMC2240_S2GB_SHIFT)
+        );
+        println!(
+            "s2ga {}",
+            read_field(stat, TMC2240_S2GA_MASK, TMC2240_S2GA_SHIFT)
+        );
+        println!(
+            "otpw {}",
+            read_field(stat, TMC2240_OTPW_MASK, TMC2240_OTPW_SHIFT)
+        );
+        println!("ot {}", read_field(stat, TMC2240_OT_MASK, TMC2240_OT_SHIFT));
+        println!(
+            "cs_actual {}",
+            read_field(stat, TMC2240_CS_ACTUAL_MASK, TMC2240_CS_ACTUAL_SHIFT)
+        );
+        println!(
+            "fsactive {}",
+            read_field(stat, TMC2240_FSACTIVE_MASK, TMC2240_FSACTIVE_SHIFT)
+        );
+        println!(
+            "stealth {}",
+            read_field(stat, TMC2240_STEALTH_MASK, TMC2240_STEALTH_SHIFT)
+        );
+        println!(
+            "s2vsb {}",
+            read_field(stat, TMC2240_S2VSB_MASK, TMC2240_S2VSB_SHIFT)
+        );
+        println!(
+            "s2vsa {}",
+            read_field(stat, TMC2240_S2VSA_MASK, TMC2240_S2VSA_SHIFT)
+        );
+    }
+}
+
+struct Bytes<'a>(&'a [u8]);
+
+impl<'a> core::fmt::Binary for Bytes<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "[")?;
+        for byte in self.0 {
+            core::fmt::Binary::fmt(byte, f)?;
+            writeln!(f, ",")?;
+        }
+        writeln!(f, "]")?;
+        Ok(())
     }
 }
 
@@ -345,7 +428,7 @@ fn write_spi(address: u8, value: i32) {
         let mut spi = SPI.borrow_ref_mut(cs);
         let spi = spi.as_mut().unwrap();
 
-        println!("writing to spi: {:x?}", data);
+        println!("writing to spi: {:x?} {:x?}", address, data);
 
         spi.transfer(&mut data[..])
             .expect("Symmetric transfer failed");
@@ -384,11 +467,27 @@ fn set_field(
     value: u32,
 ) {
     let addr = addr & TMC_ADDRESS_MASK;
+    println!(
+        "setting: {:x?} to {:02x}                         ({:08b})",
+        addr, value, value
+    );
+    println!("mask:             ({:032b})", mask);
+
+    let shifted = ((value << shift) & mask) as u32;
+    println!("shifted:          ({:032b})", shifted);
 
     let old_value = reg[addr as usize];
+    println!("old:     {:08x?} ({:032b})", old_value, old_value);
     let cleared = (old_value) & (!(mask));
-    let new_value = ((value << shift) & mask) as u32;
-    reg[addr as usize] = cleared | new_value;
+    println!("cleared: {:08x?} ({:032b})", cleared, cleared);
+    let new = cleared | shifted;
+    println!("new:     {:08x?} ({:032b})", new, new);
+    println!("");
+    reg[addr as usize] = new;
+}
+
+fn read_field(value: u32, mask: u32, shift: u32) -> u32 {
+    return (value & mask) >> shift;
 }
 
 trait LogExt {
