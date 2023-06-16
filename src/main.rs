@@ -29,16 +29,18 @@ use tmc_rs::{
     TMC2240_EN_PWM_MODE_MASK, TMC2240_EN_PWM_MODE_SHIFT, TMC2240_FSACTIVE_MASK,
     TMC2240_FSACTIVE_SHIFT, TMC2240_GCONF, TMC2240_GSTAT, TMC2240_HEND_OFFSET_MASK,
     TMC2240_HEND_OFFSET_SHIFT, TMC2240_HSTRT_TFD210_MASK, TMC2240_HSTRT_TFD210_SHIFT,
-    TMC2240_INTPOL_MASK, TMC2240_INTPOL_SHIFT, TMC2240_IOIN, TMC2240_MRES_MASK, TMC2240_MRES_SHIFT,
-    TMC2240_MSCNT, TMC2240_OLA_MASK, TMC2240_OLA_SHIFT, TMC2240_OTPW_MASK, TMC2240_OTPW_SHIFT,
+    TMC2240_IHOLD_IRUN, TMC2240_INTPOL_MASK, TMC2240_INTPOL_SHIFT, TMC2240_IOIN, TMC2240_IRUN_MASK,
+    TMC2240_IRUN_SHIFT, TMC2240_MRES_MASK, TMC2240_MRES_SHIFT, TMC2240_MSCNT, TMC2240_OLA_MASK,
+    TMC2240_OLA_SHIFT, TMC2240_OLB_MASK, TMC2240_OLB_SHIFT, TMC2240_OTPW_MASK, TMC2240_OTPW_SHIFT,
     TMC2240_OT_MASK, TMC2240_OT_SHIFT, TMC2240_PWMCONF, TMC2240_PWM_AUTOGRAD_MASK,
     TMC2240_PWM_AUTOGRAD_SHIFT, TMC2240_PWM_AUTOSCALE_MASK, TMC2240_PWM_AUTOSCALE_SHIFT,
     TMC2240_PWM_FREQ_MASK, TMC2240_PWM_FREQ_SHIFT, TMC2240_PWM_MEAS_SD_ENABLE_MASK,
     TMC2240_PWM_MEAS_SD_ENABLE_SHIFT, TMC2240_REGISTER_COUNT, TMC2240_S2GA_MASK,
     TMC2240_S2GA_SHIFT, TMC2240_S2GB_MASK, TMC2240_S2GB_SHIFT, TMC2240_S2VSA_MASK,
-    TMC2240_S2VSA_SHIFT, TMC2240_S2VSB_MASK, TMC2240_S2VSB_SHIFT, TMC2240_STEALTH_MASK,
+    TMC2240_S2VSA_SHIFT, TMC2240_S2VSB_MASK, TMC2240_S2VSB_SHIFT,
+    TMC2240_SPI_STATUS_STANDSTILL_MASK, TMC2240_SPI_STATUS_STANDSTILL_SHIFT, TMC2240_STEALTH_MASK,
     TMC2240_STEALTH_SHIFT, TMC2240_TBL_MASK, TMC2240_TBL_SHIFT, TMC2240_TOFF_MASK,
-    TMC2240_TOFF_SHIFT, TMC2240_XENC, TMC_ADDRESS_MASK, TMC_REGISTER_COUNT, TMC_WRITE_BIT, TMC2240_IHOLD_IRUN, TMC2240_IRUN_MASK, TMC2240_IRUN_SHIFT,
+    TMC2240_TOFF_SHIFT, TMC2240_XENC, TMC_ADDRESS_MASK, TMC_REGISTER_COUNT, TMC_WRITE_BIT,
 };
 
 use core::cell::RefCell;
@@ -48,11 +50,8 @@ use critical_section::Mutex;
 static SPI: Mutex<RefCell<Option<Spi<hal::peripherals::SPI2, FullDuplexMode>>>> =
     Mutex::new(RefCell::new(None));
 
-// static STEP: Mutex<RefCell<Option<Timer<Timer0<TIMG0>>>>> = Mutex::new(RefCell::new(None));
-
 static ALARM0: Mutex<RefCell<Option<Alarm<Periodic, 0>>>> = Mutex::new(RefCell::new(None));
 
-static STEP: Mutex<RefCell<Option<Gpio17<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
 static DIR: Mutex<RefCell<Option<Gpio18<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
@@ -112,9 +111,8 @@ fn main() -> ! {
 
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
-    let mut lstimer0 = ledc.get_timer::<LowSpeed>(timer::Number::Timer0);
-
-    lstimer0
+    let mut clk_timer = ledc.get_timer::<LowSpeed>(timer::Number::Timer0);
+    clk_timer
         .configure(timer::config::Config {
             duty: timer::config::Duty::Duty1Bit,
             clock_source: timer::LSClockSource::APBClk,
@@ -123,10 +121,32 @@ fn main() -> ! {
         .log()
         .unwrap();
 
-    let mut channel0 = ledc.get_channel(channel::Number::Channel0, clk);
-    channel0
+    let mut clk_channel = ledc.get_channel(channel::Number::Channel0, clk);
+    clk_channel
         .configure(channel::config::Config {
-            timer: &lstimer0,
+            timer: &clk_timer,
+            duty_pct: 50,
+            pin_config: channel::config::PinConfig::PushPull,
+        })
+        .log()
+        .unwrap();
+
+    //let t_step = MicrosDurationU32::micros(3000);
+    //let f_step = t_step.into_rate();
+    //println!("t_step {} f_step {}", t_step, f_step);
+    let step_config = timer::config::Config {
+        duty: timer::config::Duty::Duty1Bit,
+        clock_source: timer::LSClockSource::APBClk,
+        frequency: 2000u32.Hz(),
+    };
+
+    let mut step_timer = ledc.get_timer::<LowSpeed>(timer::Number::Timer1);
+    step_timer.configure(step_config).log().unwrap();
+
+    let mut step_channel = ledc.get_channel(channel::Number::Channel1, step);
+    step_channel
+        .configure(channel::config::Config {
+            timer: &step_timer,
             duty_pct: 50,
             pin_config: channel::config::PinConfig::PushPull,
         })
@@ -152,20 +172,8 @@ fn main() -> ! {
     //};
     // tmc_ramp_linear_init(&mut ramp);
 
-    let t_step = MicrosDurationU32::millis(4);
-    let f_step = t_step.into_rate();
-    println!("t_step {} f_step {}", t_step, f_step);
-
-    let timer = SystemTimer::new(peripherals.SYSTIMER);
-    let alarm = timer.alarm0.into_periodic();
-    alarm.set_period(f_step);
-    alarm.clear_interrupt();
-    alarm.interrupt_enable(true);
-
     critical_section::with(|cs| {
         SPI.borrow_ref_mut(cs).replace(spi);
-        ALARM0.borrow_ref_mut(cs).replace(alarm);
-        STEP.borrow_ref_mut(cs).replace(step);
         DIR.borrow_ref_mut(cs).replace(dir);
     });
 
@@ -239,7 +247,7 @@ fn main() -> ! {
         TMC2240_CHOPCONF,
         TMC2240_MRES_MASK,
         TMC2240_MRES_SHIFT,
-        8,
+        4,
     );
     set_field(
         &mut register_reset_state,
@@ -311,30 +319,14 @@ fn main() -> ! {
             }
         }
 
-        delay.delay_ms(1000u32);
-
-        let resp = read_spi(TMC2240_MSCNT as u8);
-        println!("mscnt {:?}", resp[4]);
-
-        let resp = read_spi(TMC2240_CHOPCONF as u8);
-        println!("chopconf[4] {:b}", resp[4]);
-
-        // let resp = critical_section::with(|cs| {
-        //     let mut spi = SPI.borrow_ref_mut(cs);
-        //     let spi = spi.as_mut().unwrap();
-
-        //     spi.transfer(&mut [0, 1, 2, 3, 4]).log().unwrap();
-        //     let mut msg = [0, 1, 2, 3, 4];
-        //     let resp = spi.transfer(&mut msg).log().unwrap();
-        //     println!("{:x?}", resp);
-        //     resp[0]
-        // });
-
-        // let status = SPIStatus::from(resp);
-        // println!("{:#?}", status);
+        delay.delay_ms(500u32);
 
         let resp = read_spi(TMC2240_DRVSTATUS as u8);
         let stat = u32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]);
+        println!(
+            "olb {}",
+            read_field(stat, TMC2240_OLB_MASK, TMC2240_OLB_SHIFT)
+        );
         println!(
             "ola {}",
             read_field(stat, TMC2240_OLA_MASK, TMC2240_OLA_SHIFT)
@@ -501,19 +493,4 @@ impl<T, E: Debug> LogExt for Result<T, E> {
         }
         self
     }
-}
-
-#[interrupt]
-fn SYSTIMER_TARGET0() {
-    critical_section::with(|cs| {
-        let mut step = STEP.borrow_ref_mut(cs);
-        let step = step.as_mut().unwrap();
-        step.toggle().log().unwrap();
-
-        ALARM0
-            .borrow_ref_mut(cs)
-            .as_mut()
-            .unwrap()
-            .clear_interrupt();
-    });
 }
