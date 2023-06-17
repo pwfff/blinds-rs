@@ -6,10 +6,18 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-hal = { package = "esp32s3-hal", version = "0.9.0" }
-esp-backtrace = { version = "0.7.0", features = ["esp32s3", "panic-handler", "exception-handler", "print-uart"] }
-esp-println = { version = "0.5.0", features = ["esp32s3"] }
+embassy-time       = { version = "0.1.1", features = ["nightly"] }
+hal = { package = "esp32s3-hal", path = "../esp-hal/esp32s3-hal/", features = ["embassy", "embassy-time-systick"] }
 tmc-rs = { version = "0.1.0", path = "../tmc-rs" }
 fugit = "0.3.7"
-critical-section = "1.1.1"
 embedded-hal-1 = { version = "=1.0.0-alpha.10", package = "embedded-hal" }
+critical-section  = "1.1.1"
+embassy-executor  = { version = "0.2.0", features = ["nightly", "integrated-timers", "arch-xtensa", "executor-thread"] }
+esp-alloc         = "0.3.0"
+esp-backtrace     = { version = "0.7.0", features = ["esp32s3", "panic-handler", "exception-handler", "print-uart"] }
+esp-println       = { version = "0.5.0", features = ["esp32s3", "log"] }
+static_cell       = "1.0.0"
+
+[features]
+default = ["embassy-time-systick"]
+embassy-time-systick = []

@@ -1,58 +1,162 @@
 #![no_std]
 #![no_main]
+#![feature(type_alias_impl_trait)]
 
-use core::{fmt::Debug, mem::transmute};
+use core::{cell::RefCell, fmt::Debug, mem::transmute};
+
+use critical_section::Mutex;
+use embassy_executor::Executor;
+use embassy_time::{Duration, Timer};
+use static_cell::StaticCell;
 
 use esp_backtrace as _;
 use esp_println::println;
-use fugit::MicrosDurationU32;
+use fugit::HertzU32;
 use hal::{
-    clock::ClockControl,
-    gpio::{Gpio17, Gpio18, Output, PushPull, IO},
-    interrupt,
+    clock::{ClockControl, Clocks},
+    embassy,
+    gpio::{Gpio15, Gpio17, Gpio18, Output, PushPull, IO},
     ledc::{
         channel::{self, ChannelIFace},
         timer::{self, TimerIFace},
         LSGlobalClkSource, LowSpeed, LEDC,
     },
-    peripherals::{self, Peripherals},
+    peripherals::Peripherals,
     prelude::*,
     spi::{FullDuplexMode, SpiMode},
-    systimer::{Alarm, Periodic, SystemTimer},
+    systimer::SystemTimer,
     timer::TimerGroup,
-    Delay, Priority, Rtc, Spi,
+    Rtc, Spi,
 };
-use tmc_rs::{
-    periodic, tmc2240_defaultRegisterResetState, tmc2240_reset, tmc_ramp_linear_init,
-    ConfigState_CONFIG_RESTORE, ConfigurationTypeDef, GStat, SPIStatus, TMC_LinearRamp,
-    TMC2240_CHOPCONF, TMC2240_CS_ACTUAL_MASK, TMC2240_CS_ACTUAL_SHIFT, TMC2240_DRVSTATUS,
-    TMC2240_EN_PWM_MODE_MASK, TMC2240_EN_PWM_MODE_SHIFT, TMC2240_FSACTIVE_MASK,
-    TMC2240_FSACTIVE_SHIFT, TMC2240_GCONF, TMC2240_GSTAT, TMC2240_HEND_OFFSET_MASK,
-    TMC2240_HEND_OFFSET_SHIFT, TMC2240_HSTRT_TFD210_MASK, TMC2240_HSTRT_TFD210_SHIFT,
-    TMC2240_IHOLD_IRUN, TMC2240_INTPOL_MASK, TMC2240_INTPOL_SHIFT, TMC2240_IOIN, TMC2240_IRUN_MASK,
-    TMC2240_IRUN_SHIFT, TMC2240_MRES_MASK, TMC2240_MRES_SHIFT, TMC2240_MSCNT, TMC2240_OLA_MASK,
-    TMC2240_OLA_SHIFT, TMC2240_OLB_MASK, TMC2240_OLB_SHIFT, TMC2240_OTPW_MASK, TMC2240_OTPW_SHIFT,
-    TMC2240_OT_MASK, TMC2240_OT_SHIFT, TMC2240_PWMCONF, TMC2240_PWM_AUTOGRAD_MASK,
-    TMC2240_PWM_AUTOGRAD_SHIFT, TMC2240_PWM_AUTOSCALE_MASK, TMC2240_PWM_AUTOSCALE_SHIFT,
-    TMC2240_PWM_FREQ_MASK, TMC2240_PWM_FREQ_SHIFT, TMC2240_PWM_MEAS_SD_ENABLE_MASK,
-    TMC2240_PWM_MEAS_SD_ENABLE_SHIFT, TMC2240_REGISTER_COUNT, TMC2240_S2GA_MASK,
-    TMC2240_S2GA_SHIFT, TMC2240_S2GB_MASK, TMC2240_S2GB_SHIFT, TMC2240_S2VSA_MASK,
-    TMC2240_S2VSA_SHIFT, TMC2240_S2VSB_MASK, TMC2240_S2VSB_SHIFT,
-    TMC2240_SPI_STATUS_STANDSTILL_MASK, TMC2240_SPI_STATUS_STANDSTILL_SHIFT, TMC2240_STEALTH_MASK,
-    TMC2240_STEALTH_SHIFT, TMC2240_TBL_MASK, TMC2240_TBL_SHIFT, TMC2240_TOFF_MASK,
-    TMC2240_TOFF_SHIFT, TMC2240_XENC, TMC_ADDRESS_MASK, TMC_REGISTER_COUNT, TMC_WRITE_BIT,
-};
-
-use core::cell::RefCell;
-
-use critical_section::Mutex;
+use tmc_rs::*;
 
 static SPI: Mutex<RefCell<Option<Spi<hal::peripherals::SPI2, FullDuplexMode>>>> =
     Mutex::new(RefCell::new(None));
 
-static ALARM0: Mutex<RefCell<Option<Alarm<Periodic, 0>>>> = Mutex::new(RefCell::new(None));
+static CLOCKS: Mutex<RefCell<Option<Clocks>>> = Mutex::new(RefCell::new(None));
 
-static DIR: Mutex<RefCell<Option<Gpio18<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
+fn set_time(t: &mut dyn TimerIFace<LowSpeed>, freq: HertzU32) {
+    let config = timer::config::Config {
+        duty: timer::config::Duty::Duty1Bit,
+        clock_source: timer::LSClockSource::APBClk,
+        frequency: freq,
+    };
+
+    critical_section::with(|cs| {
+        let mut clocks = CLOCKS.borrow_ref_mut(cs);
+        let clocks = clocks.as_mut().unwrap();
+
+        t.configure(&clocks, config).log().unwrap();
+    });
+}
+
+#[embassy_executor::task]
+async fn stepper_task(
+    mut mcu: TMC2240TypeDef,
+    ledc: LEDC<'static>,
+    mut en: Gpio15<Output<PushPull>>,
+    step: Gpio17<Output<PushPull>>,
+    mut dir: Gpio18<Output<PushPull>>,
+) {
+    let mut step_timer = ledc.get_timer::<LowSpeed>(timer::Number::Timer1);
+    set_time(&mut step_timer, 2000u32.Hz());
+
+    let mut step_channel = ledc.get_channel(channel::Number::Channel1, step);
+    step_channel
+        .configure(channel::config::Config {
+            timer: &step_timer,
+            duty_pct: 50,
+            pin_config: channel::config::PinConfig::PushPull,
+        })
+        .log()
+        .unwrap();
+
+    let mut moving = false;
+    let mut opening = false;
+    loop {
+        unsafe {
+            while (*mcu.config).state > 0 {
+                periodic(&mut mcu, SystemTimer::now() as u32);
+                continue;
+            }
+        }
+
+        Timer::after(Duration::from_millis(1_000)).await;
+
+        moving = !moving;
+        if moving {
+            opening = !opening;
+        }
+
+        println!("moving: {} opening: {}", moving, opening);
+        if moving {
+            step_channel.set_duty(50).unwrap();
+            en.set_low().unwrap();
+        } else {
+            step_channel.set_duty(0).unwrap();
+            en.set_high().unwrap();
+        }
+
+        if opening {
+            dir.set_low().unwrap();
+        } else {
+            dir.set_high().unwrap();
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn run2() {
+    loop {
+        Timer::after(Duration::from_millis(1_000)).await;
+
+        let resp = read_spi(TMC2240_DRVSTATUS as u8);
+        let stat = u32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]);
+        println!(
+            "olb {}",
+            read_field(stat, TMC2240_OLB_MASK, TMC2240_OLB_SHIFT)
+        );
+        println!(
+            "ola {}",
+            read_field(stat, TMC2240_OLA_MASK, TMC2240_OLA_SHIFT)
+        );
+        println!(
+            "s2gb {}",
+            read_field(stat, TMC2240_S2GB_MASK, TMC2240_S2GB_SHIFT)
+        );
+        println!(
+            "s2ga {}",
+            read_field(stat, TMC2240_S2GA_MASK, TMC2240_S2GA_SHIFT)
+        );
+        println!(
+            "otpw {}",
+            read_field(stat, TMC2240_OTPW_MASK, TMC2240_OTPW_SHIFT)
+        );
+        println!("ot {}", read_field(stat, TMC2240_OT_MASK, TMC2240_OT_SHIFT));
+        println!(
+            "cs_actual {}",
+            read_field(stat, TMC2240_CS_ACTUAL_MASK, TMC2240_CS_ACTUAL_SHIFT)
+        );
+        println!(
+            "fsactive {}",
+            read_field(stat, TMC2240_FSACTIVE_MASK, TMC2240_FSACTIVE_SHIFT)
+        );
+        println!(
+            "stealth {}",
+            read_field(stat, TMC2240_STEALTH_MASK, TMC2240_STEALTH_SHIFT)
+        );
+        println!(
+            "s2vsb {}",
+            read_field(stat, TMC2240_S2VSB_MASK, TMC2240_S2VSB_SHIFT)
+        );
+        println!(
+            "s2vsa {}",
+            read_field(stat, TMC2240_S2VSA_MASK, TMC2240_S2VSA_SHIFT)
+        );
+    }
+}
+
+static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 #[entry]
 fn main() -> ! {
@@ -79,6 +183,13 @@ fn main() -> ! {
     wdt1.disable();
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+
+    #[cfg(feature = "embassy-time-systick")]
+    embassy::init(&clocks, SystemTimer::new(peripherals.SYSTIMER));
+
+    #[cfg(feature = "embassy-time-timg0")]
+    embassy::init(&clocks, timer_group0.timer0);
+
     let mosi = io.pins.gpio4;
     let sclk = io.pins.gpio5;
     let cs = io.pins.gpio6;
@@ -98,28 +209,25 @@ fn main() -> ! {
         &clocks,
     );
 
+    critical_section::with(|cs| {
+        SPI.borrow_ref_mut(cs).replace(spi);
+    });
+
     let clk = io.pins.gpio16.into_push_pull_output();
     let step = io.pins.gpio17.into_push_pull_output();
     let mut dir = io.pins.gpio18.into_push_pull_output();
     dir.set_low().unwrap();
 
-    let mut ledc = LEDC::new(
-        peripherals.LEDC,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
+    critical_section::with(|cs| {
+        CLOCKS.borrow_ref_mut(cs).replace(clocks);
+    });
+
+    let mut ledc = LEDC::new(peripherals.LEDC, &mut system.peripheral_clock_control);
 
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
     let mut clk_timer = ledc.get_timer::<LowSpeed>(timer::Number::Timer0);
-    clk_timer
-        .configure(timer::config::Config {
-            duty: timer::config::Duty::Duty1Bit,
-            clock_source: timer::LSClockSource::APBClk,
-            frequency: 16u32.MHz(),
-        })
-        .log()
-        .unwrap();
+    set_time(&mut clk_timer, 16u32.MHz());
 
     let mut clk_channel = ledc.get_channel(channel::Number::Channel0, clk);
     clk_channel
@@ -134,24 +242,6 @@ fn main() -> ! {
     //let t_step = MicrosDurationU32::micros(3000);
     //let f_step = t_step.into_rate();
     //println!("t_step {} f_step {}", t_step, f_step);
-    let step_config = timer::config::Config {
-        duty: timer::config::Duty::Duty1Bit,
-        clock_source: timer::LSClockSource::APBClk,
-        frequency: 2000u32.Hz(),
-    };
-
-    let mut step_timer = ledc.get_timer::<LowSpeed>(timer::Number::Timer1);
-    step_timer.configure(step_config).log().unwrap();
-
-    let mut step_channel = ledc.get_channel(channel::Number::Channel1, step);
-    step_channel
-        .configure(channel::config::Config {
-            timer: &step_timer,
-            duty_pct: 50,
-            pin_config: channel::config::PinConfig::PushPull,
-        })
-        .log()
-        .unwrap();
 
     //let mut ramp = TMC_LinearRamp {
     //    maxVelocity: 0,
@@ -171,11 +261,6 @@ fn main() -> ! {
     //    stopVelocity: 0,
     //};
     // tmc_ramp_linear_init(&mut ramp);
-
-    critical_section::with(|cs| {
-        SPI.borrow_ref_mut(cs).replace(spi);
-        DIR.borrow_ref_mut(cs).replace(dir);
-    });
 
     unsafe {
         tmc_rs::SPIWriter = Some(write_spi);
@@ -299,72 +384,27 @@ fn main() -> ! {
     let stat = GStat::from(read_spi(TMC2240_GSTAT as u8)[4]);
     println!("gstat {:?}", stat);
 
-    interrupt::enable(
-        peripherals::Interrupt::SYSTIMER_TARGET0,
-        Priority::Priority1,
-    )
-    .log()
-    .unwrap();
+    //interrupt::enable(
+    //    peripherals::Interrupt::SYSTIMER_TARGET0,
+    //    Priority::Priority1,
+    //)
+    //.log()
+    //.unwrap();
 
-    en.set_low().unwrap();
+    let executor = EXECUTOR.init(Executor::new());
+    executor.run(|spawner| {
+        spawner.spawn(stepper_task(mcu, ledc, en, step, dir)).ok();
+        spawner.spawn(run2()).ok();
+    });
 
-    let mut delay = Delay::new(&clocks);
-
+    /*
     loop {
         // wait for register writes
-        unsafe {
-            while (*mcu.config).state > 0 {
-                periodic(&mut mcu, SystemTimer::now() as u32);
-                continue;
-            }
-        }
 
         delay.delay_ms(500u32);
 
-        let resp = read_spi(TMC2240_DRVSTATUS as u8);
-        let stat = u32::from_be_bytes([resp[1], resp[2], resp[3], resp[4]]);
-        println!(
-            "olb {}",
-            read_field(stat, TMC2240_OLB_MASK, TMC2240_OLB_SHIFT)
-        );
-        println!(
-            "ola {}",
-            read_field(stat, TMC2240_OLA_MASK, TMC2240_OLA_SHIFT)
-        );
-        println!(
-            "s2gb {}",
-            read_field(stat, TMC2240_S2GB_MASK, TMC2240_S2GB_SHIFT)
-        );
-        println!(
-            "s2ga {}",
-            read_field(stat, TMC2240_S2GA_MASK, TMC2240_S2GA_SHIFT)
-        );
-        println!(
-            "otpw {}",
-            read_field(stat, TMC2240_OTPW_MASK, TMC2240_OTPW_SHIFT)
-        );
-        println!("ot {}", read_field(stat, TMC2240_OT_MASK, TMC2240_OT_SHIFT));
-        println!(
-            "cs_actual {}",
-            read_field(stat, TMC2240_CS_ACTUAL_MASK, TMC2240_CS_ACTUAL_SHIFT)
-        );
-        println!(
-            "fsactive {}",
-            read_field(stat, TMC2240_FSACTIVE_MASK, TMC2240_FSACTIVE_SHIFT)
-        );
-        println!(
-            "stealth {}",
-            read_field(stat, TMC2240_STEALTH_MASK, TMC2240_STEALTH_SHIFT)
-        );
-        println!(
-            "s2vsb {}",
-            read_field(stat, TMC2240_S2VSB_MASK, TMC2240_S2VSB_SHIFT)
-        );
-        println!(
-            "s2vsa {}",
-            read_field(stat, TMC2240_S2VSA_MASK, TMC2240_S2VSA_SHIFT)
-        );
     }
+    */
 }
 
 struct Bytes<'a>(&'a [u8]);
