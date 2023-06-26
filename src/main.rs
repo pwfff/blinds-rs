@@ -28,7 +28,7 @@ use hal::{
     timer::TimerGroup,
     Rtc, Spi,
 };
-use tmc_rs::*;
+use tmc_rs::{*, registers::tmc2240::TMC2240, registers::*};
 
 static SPI: Mutex<RefCell<Option<Spi<hal::peripherals::SPI2, FullDuplexMode>>>> =
     Mutex::new(RefCell::new(None));
@@ -52,7 +52,6 @@ fn set_time(t: &mut dyn TimerIFace<LowSpeed>, freq: HertzU32) {
 
 #[embassy_executor::task]
 async fn stepper_task(
-    mut mcu: TMC2240TypeDef,
     ledc: LEDC<'static>,
     mut en: Gpio15<Output<PushPull>>,
     step: Gpio17<Output<PushPull>>,
@@ -65,22 +64,17 @@ async fn stepper_task(
     step_channel
         .configure(channel::config::Config {
             timer: &step_timer,
-            duty_pct: 50,
+            duty_pct: 0,
             pin_config: channel::config::PinConfig::PushPull,
         })
         .log()
         .unwrap();
 
+    en.set_low().unwrap();
+
     let mut moving = false;
     let mut opening = false;
     loop {
-        unsafe {
-            while (*mcu.config).state > 0 {
-                periodic(&mut mcu, SystemTimer::now() as u32);
-                continue;
-            }
-        }
-
         Timer::after(Duration::from_millis(1_000)).await;
 
         moving = !moving;
@@ -91,10 +85,8 @@ async fn stepper_task(
         println!("moving: {} opening: {}", moving, opening);
         if moving {
             step_channel.set_duty(50).unwrap();
-            en.set_low().unwrap();
         } else {
             step_channel.set_duty(0).unwrap();
-            en.set_high().unwrap();
         }
 
         if opening {
@@ -106,8 +98,15 @@ async fn stepper_task(
 }
 
 #[embassy_executor::task]
-async fn run2() {
+async fn spi_task(mut spi: Spi<'static, hal::peripherals::SPI2, FullDuplexMode>) {
     loop {
+        //unsafe {
+        //    while (*mcu.config).state > 0 {
+        //        periodic(&mut mcu, SystemTimer::now() as u32);
+        //        continue;
+        //    }
+        //}
+
         Timer::after(Duration::from_millis(1_000)).await;
 
         let resp = read_spi(TMC2240_DRVSTATUS as u8);
@@ -262,127 +261,146 @@ fn main() -> ! {
     //};
     // tmc_ramp_linear_init(&mut ramp);
 
-    unsafe {
-        tmc_rs::SPIWriter = Some(write_spi);
-    }
+    //let mcu_new = tmc2240::new();
+    //mcu_new.reset(|addr, val| println!("addr: {:04x}\nval: {:08x}", addr, val));
 
-    let config = ConfigurationTypeDef {
-        state: ConfigState_CONFIG_RESTORE,
-        configIndex: 0,
-        shadowRegister: [0i32; 128usize],
-        reset: None,
-        restore: None,
-        callback: None,
-        channel: 0,
-    };
-    let mut register_reset_state: [u32; TMC2240_REGISTER_COUNT as usize] =
-        tmc2240_defaultRegisterResetState.clone();
+    //unsafe {
+    //    tmc_rs::SPIWriter = Some(write_spi);
+    //}
 
-    set_field(
-        &mut register_reset_state,
-        TMC2240_IHOLD_IRUN,
-        TMC2240_IRUN_MASK,
-        TMC2240_IRUN_SHIFT,
-        28,
-    );
+    //let config = ConfigurationTypeDef {
+    //    state: ConfigState_CONFIG_RESTORE,
+    //    configIndex: 0,
+    //    shadowRegister: [0i32; 128usize],
+    //    reset: None,
+    //    restore: None,
+    //    callback: None,
+    //    channel: 0,
+    //};
+    //let mut register_reset_state: [u32; TMC2240_REGISTER_COUNT as usize] =
+    //    tmc2240_defaultRegisterResetState.clone();
 
-    // enable PWM mode in general conf
-    set_field(
-        &mut register_reset_state,
-        TMC2240_GCONF,
-        TMC2240_EN_PWM_MODE_MASK,
-        TMC2240_EN_PWM_MODE_SHIFT,
-        1,
-    );
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_IHOLD_IRUN,
+    //    TMC2240_IRUN_MASK,
+    //    TMC2240_IRUN_SHIFT,
+    //    28,
+    //);
 
-    // enable autograd, autoscale, current measurement
-    set_field(
-        &mut register_reset_state,
-        TMC2240_PWMCONF,
-        TMC2240_PWM_AUTOGRAD_MASK,
-        TMC2240_PWM_AUTOGRAD_SHIFT,
-        1,
-    );
-    set_field(
-        &mut register_reset_state,
-        TMC2240_PWMCONF,
-        TMC2240_PWM_AUTOSCALE_MASK,
-        TMC2240_PWM_AUTOSCALE_SHIFT,
-        1,
-    );
-    set_field(
-        &mut register_reset_state,
-        TMC2240_PWMCONF,
-        TMC2240_PWM_MEAS_SD_ENABLE_MASK,
-        TMC2240_PWM_MEAS_SD_ENABLE_SHIFT,
-        1,
-    );
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_IHOLD_IRUN,
+    //    TMC2240_IRUNDELAY_MASK,
+    //    TMC2240_IRUNDELAY_SHIFT,
+    //    10,
+    //);
 
-    // default 0 recommended for 16MHz clk
-    set_field(
-        &mut register_reset_state,
-        TMC2240_PWMCONF,
-        TMC2240_PWM_FREQ_MASK,
-        TMC2240_PWM_FREQ_SHIFT,
-        0,
-    );
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_IHOLD_IRUN,
+    //    TMC2240_IHOLDDELAY_MASK,
+    //    TMC2240_IHOLDDELAY_SHIFT,
+    //    10,
+    //);
 
-    set_field(
-        &mut register_reset_state,
-        TMC2240_CHOPCONF,
-        TMC2240_MRES_MASK,
-        TMC2240_MRES_SHIFT,
-        4,
-    );
-    set_field(
-        &mut register_reset_state,
-        TMC2240_CHOPCONF,
-        TMC2240_INTPOL_MASK,
-        TMC2240_INTPOL_SHIFT,
-        1,
-    );
+    //// enable PWM mode in general conf
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_GCONF,
+    //    TMC2240_EN_PWM_MODE_MASK,
+    //    TMC2240_EN_PWM_MODE_SHIFT,
+    //    1,
+    //);
 
-    // configure CHOPCONF - not used, but must be configured to run the motor
-    set_field(
-        &mut register_reset_state,
-        TMC2240_CHOPCONF,
-        TMC2240_TOFF_MASK,
-        TMC2240_TOFF_SHIFT,
-        3,
-    );
-    set_field(
-        &mut register_reset_state,
-        TMC2240_CHOPCONF,
-        TMC2240_TBL_MASK,
-        TMC2240_TBL_SHIFT,
-        2,
-    );
-    set_field(
-        &mut register_reset_state,
-        TMC2240_CHOPCONF,
-        TMC2240_HSTRT_TFD210_MASK,
-        TMC2240_HSTRT_TFD210_SHIFT,
-        4,
-    );
-    set_field(
-        &mut register_reset_state,
-        TMC2240_CHOPCONF,
-        TMC2240_HEND_OFFSET_MASK,
-        TMC2240_HEND_OFFSET_SHIFT,
-        0,
-    );
+    //// enable autograd, autoscale, current measurement
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_PWMCONF,
+    //    TMC2240_PWM_AUTOGRAD_MASK,
+    //    TMC2240_PWM_AUTOGRAD_SHIFT,
+    //    1,
+    //);
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_PWMCONF,
+    //    TMC2240_PWM_AUTOSCALE_MASK,
+    //    TMC2240_PWM_AUTOSCALE_SHIFT,
+    //    1,
+    //);
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_PWMCONF,
+    //    TMC2240_PWM_MEAS_SD_ENABLE_MASK,
+    //    TMC2240_PWM_MEAS_SD_ENABLE_SHIFT,
+    //    1,
+    //);
 
-    let register_reset_state = unsafe { transmute(register_reset_state) };
-    let mut mcu = tmc_rs::new(0, config, &register_reset_state, None);
+    //// default 0 recommended for 16MHz clk
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_PWMCONF,
+    //    TMC2240_PWM_FREQ_MASK,
+    //    TMC2240_PWM_FREQ_SHIFT,
+    //    0,
+    //);
 
-    println!("resetting mcu");
-    unsafe { tmc2240_reset(&mut mcu) };
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_CHOPCONF,
+    //    TMC2240_MRES_MASK,
+    //    TMC2240_MRES_SHIFT,
+    //    4,
+    //);
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_CHOPCONF,
+    //    TMC2240_INTPOL_MASK,
+    //    TMC2240_INTPOL_SHIFT,
+    //    1,
+    //);
 
-    // clear status flags, check GSTAT
+    //// configure CHOPCONF - not used, but must be configured to run the motor
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_CHOPCONF,
+    //    TMC2240_TOFF_MASK,
+    //    TMC2240_TOFF_SHIFT,
+    //    3,
+    //);
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_CHOPCONF,
+    //    TMC2240_TBL_MASK,
+    //    TMC2240_TBL_SHIFT,
+    //    2,
+    //);
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_CHOPCONF,
+    //    TMC2240_HSTRT_TFD210_MASK,
+    //    TMC2240_HSTRT_TFD210_SHIFT,
+    //    4,
+    //);
+    //set_field(
+    //    &mut register_reset_state,
+    //    TMC2240_CHOPCONF,
+    //    TMC2240_HEND_OFFSET_MASK,
+    //    TMC2240_HEND_OFFSET_SHIFT,
+    //    0,
+    //);
 
-    write_spi_bytes(TMC2240_GSTAT as u8, [255; 4]);
-    let stat = GStat::from(read_spi(TMC2240_GSTAT as u8)[4]);
-    println!("gstat {:?}", stat);
+    //let register_reset_state = unsafe { transmute(register_reset_state) };
+    //let mut mcu = tmc_rs::new(0, config, &register_reset_state, None);
+
+    //println!("resetting mcu");
+    //unsafe { tmc2240_reset(&mut mcu) };
+
+    //// clear status flags, check GSTAT
+
+    //write_spi_bytes(TMC2240_GSTAT as u8, [255; 4]);
+    //let stat = GStat::from(read_spi(TMC2240_GSTAT as u8)[4]);
+    //println!("gstat {:?}", stat);
 
     //interrupt::enable(
     //    peripherals::Interrupt::SYSTIMER_TARGET0,
@@ -393,8 +411,8 @@ fn main() -> ! {
 
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| {
-        spawner.spawn(stepper_task(mcu, ledc, en, step, dir)).ok();
-        spawner.spawn(run2()).ok();
+        spawner.spawn(stepper_task(ledc, en, step, dir)).ok();
+        spawner.spawn(spi_task(spi)).ok();
     });
 
     /*
