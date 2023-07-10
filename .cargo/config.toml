@@ -1,13 +1,19 @@
-[target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor --port /dev/ttyACM0"
-
 [build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor --port /dev/ttyACM0"
 rustflags = [
-  "-C", "link-arg=-Tlinkall.x",
-  "-C", "link-arg=-nostartfiles",
+  "--cfg", "espidf_time64",
+#  "-C", "default-linker-libraries",
 ]
 
-target = "xtensa-esp32s3-none-elf"
-
 [unstable]
-build-std = ["core"]
+build-std = ["std", "panic_abort"]
+
+[env]
+# Note: these variables are not used when using pio builder (`cargo build --features pio`)
+ESP_IDF_VERSION = "release/v5.1"
+WIFI_SSID = "zerocool"
+WIFI_PASS = "nope"
