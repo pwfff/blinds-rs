@@ -12,7 +12,7 @@ use core::fmt::Debug;
 use esp_idf_hal::{
     delay::FreeRtos,
     gpio::{Output, OutputPin, PinDriver},
-    ledc::{self, LedcDriver, LedcTimerDriver, Resolution},
+    ledc::{self, LedcChannel, LedcDriver, LedcTimer, LedcTimerDriver, Resolution},
     peripheral::Peripheral,
     prelude::Peripherals,
     spi::{self, SpiDeviceDriver, SpiDriver, SpiDriverConfig, SPI2},
@@ -20,104 +20,52 @@ use esp_idf_hal::{
 };
 use std::{sync::Arc, time::Duration};
 
-//use critical_section::Mutex;
-//use embassy_executor::Executor;
-//use embassy_time::{Duration, Timer};
-//use static_cell::StaticCell;
-//
-//use esp_backtrace as _;
-//use esp_println::println;
-//use fugit::HertzU32;
-//use hal::{
-//    clock::{ClockControl, Clocks},
-//    embassy,
-//    gpio::{Gpio15, Gpio17, Gpio18, Output, PushPull, IO},
-//    ledc::{
-//        channel::{self, ChannelIFace},
-//        timer::{self, TimerIFace},
-//        LSGlobalClkSource, LowSpeed, LEDC,
-//    },
-//    peripherals::{Peripherals, MCPWM0},
-//    prelude::*,
-//    spi::{FullDuplexMode, SpiMode},
-//    systimer::SystemTimer,
-//    timer::TimerGroup,
-//    Rtc, Spi, mcpwm::{MCPWM, PeripheralClockConfig, operator::PwmPinConfig, timer::PwmWorkingMode},
-//};
-//use tmc_rs::{*, registers::tmc2240::TMC2240, registers::*};
 use tmc_rs::registers::{tmc2240::TMC2240, *};
 
-//static SPI: Mutex<RefCell<Option<Spi<hal::peripherals::SPI2, FullDuplexMode>>>> =
-//    Mutex::new(RefCell::new(None));
-
-//static CLOCKS: Mutex<RefCell<Option<Clocks>>> = Mutex::new(RefCell::new(None));
-
-//fn set_time(t: &mut hal::ledc::timer::Timer<LowSpeed>, freq: HertzU32) {
-//    let config = timer::config::Config {
-//        duty: timer::config::Duty::Duty1Bit,
-//        clock_source: timer::LSClockSource::APBClk,
-//        frequency: freq,
-//    };
-//
-//    critical_section::with(|cs| {
-//        let mut clocks = CLOCKS.borrow_ref_mut(cs);
-//        let clocks = clocks.as_mut().unwrap();
-//
-//        let src_freq: u32 = clocks.apb_clock.to_Hz();
-//        let precision = 1 << config.duty as u32;
-//        let frequency: u32 = config.frequency.raw();
-//        debug!(
-//            "src: {:#?}, prec: {:#?}, freq: {:#?}",
-//            src_freq, precision, frequency
-//        );
-//
-//        let mut divisor = ((src_freq as u64) << 8) / frequency as u64 / precision as u64;
-//        debug!("div1: {:#?}", divisor);
-//
-//        const LEDC_TIMER_DIV_NUM_MAX: u64 = 0x3FFFF;
-//        if divisor > LEDC_TIMER_DIV_NUM_MAX {
-//            // APB_CLK results in divisor which too high. Try using REF_TICK as clock
-//            // source.
-//            divisor = ((1_000_000 as u64) << 8) / frequency as u64 / precision as u64;
-//        }
-//        debug!("div2: {:#?}", divisor);
-//        debug!("max: {:#?}", LEDC_TIMER_DIV_NUM_MAX);
-//
-//        t.configure(&clocks, config)
-//            .log()
-//            .expect("couldn't configure?");
-//    });
-//}
-
-fn stepper_task<'a, S: OutputPin, D: OutputPin>(
-    mut step: PinDriver<'a, S, Output>,
-    mut dir: PinDriver<'a, D, Output>,
+fn stepper_task<
+    'a,
+    STEP: Peripheral<P = impl OutputPin>,
+    DIR: Peripheral<P = impl OutputPin>,
+    T: Peripheral<P = impl LedcTimer>,
+    C: Peripheral<P = impl LedcChannel>,
+>(
+    ledc_timer: T,
+    ledc_channel: C,
+    step: STEP,
+    dir: DIR,
 ) -> anyhow::Result<()> {
     let mut moving = true;
     let mut opening = false;
-    let mut i = 0u32;
+
+    let mut dir = PinDriver::output(dir)?;
+    dir.set_low().unwrap();
+
+    let step_config = ledc::config::TimerConfig::new()
+        .resolution(Resolution::Bits8)
+        .frequency(2.kHz().into());
+    let step_timer = Arc::new(LedcTimerDriver::new(ledc_timer, &step_config)?);
+    let mut step_ledc = LedcDriver::new(ledc_channel, step_timer, step)?;
+    step_ledc.set_duty(50)?;
+    step_ledc.enable()?;
+
     loop {
-        FreeRtos::delay_ms(5);
+        FreeRtos::delay_ms(1000);
 
-        //moving = !moving;
-        //if moving {
-        //    opening = !opening;
-        //}
-
-        if i % 10 == 0 {
-            debug!("moving: {} opening: {}", moving, opening);
-        }
+        moving = !moving;
         if moving {
-            step.toggle()?;
+            opening = !opening;
         }
 
-        //if opening {
-        //    dir.set_low()?;
-        //} else {
-        //    dir.set_high()?;
-        //}
+        step_ledc.set_duty(match moving {
+            true => 50,
+            false => 0,
+        })?;
 
-        i += 1;
+        if opening {
+            dir.set_low()?;
+        } else {
+            dir.set_high()?;
+        }
     }
 }
 
@@ -186,7 +134,7 @@ fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
     mcu.PWMCONF.set_pwm_meas_sd_enable(true);
     mcu.PWMCONF.set_PWM_FREQ(0);
 
-    mcu.CHOPCONF.set_MRES(6);
+    mcu.CHOPCONF.set_MRES(4);
     mcu.CHOPCONF.set_dedge(true);
     mcu.CHOPCONF.set_intpol(true);
     mcu.CHOPCONF.set_TOFF(3);
@@ -205,13 +153,6 @@ fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
     en.set_low().unwrap();
 
     loop {
-        //unsafe {
-        //    while (*mcu.config).state > 0 {
-        //        periodic(&mut mcu, SystemTimer::now() as u32);
-        //        continue;
-        //    }
-        //}
-
         FreeRtos::delay_ms(1_000);
 
         let stat = mcu.DRVSTATUS.read(&mut spi);
@@ -219,42 +160,12 @@ fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
     }
 }
 
-//static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-
 fn main() -> anyhow::Result<()> {
     esp_idf_sys::link_patches();
 
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take().unwrap();
-    //let mut system = peripherals.SYSTEM.split();
-    //let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
-
-    //// Disable the RTC and TIMG watchdog timers
-    //let mut rtc = Rtc::new(peripherals.RTC_CNTL);
-    //let timer_group0 = TimerGroup::new(
-    //    peripherals.TIMG0,
-    //    &clocks,
-    //    &mut system.peripheral_clock_control,
-    //);
-    //let mut wdt0 = timer_group0.wdt;
-    //let timer_group1 = TimerGroup::new(
-    //    peripherals.TIMG1,
-    //    &clocks,
-    //    &mut system.peripheral_clock_control,
-    //);
-    //let mut wdt1 = timer_group1.wdt;
-    //rtc.rwdt.disable();
-    //wdt0.disable();
-    //wdt1.disable();
-
-    //let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-
-    #[cfg(feature = "embassy-time-systick")]
-    embassy::init(&clocks, SystemTimer::new(peripherals.SYSTIMER));
-
-    #[cfg(feature = "embassy-time-timg0")]
-    embassy::init(&clocks, timer_group0.timer0);
 
     let mosi = peripherals.pins.gpio4;
     let sclk = peripherals.pins.gpio5;
@@ -263,25 +174,12 @@ fn main() -> anyhow::Result<()> {
     let mut en = PinDriver::output(peripherals.pins.gpio15)?;
     en.set_high().log().unwrap();
 
-    //let spi = Spi::new(
-    //    peripherals.SPI2,
-    //    sclk,
-    //    mosi,
-    //    miso,
-    //    cs,
-    //    5000u32.kHz(),
-    //    SpiMode::Mode3,
-    //    &mut system.peripheral_clock_control,
-    //    &clocks,
-    //);
     let spi = peripherals.spi2;
-
-    let driver = SpiDriver::new::<SPI2>(spi, sclk, mosi, Some(miso), &SpiDriverConfig::new())?;
+    let spi_driver = SpiDriver::new::<SPI2>(spi, sclk, mosi, Some(miso), &SpiDriverConfig::new())?;
 
     let clk = peripherals.pins.gpio16;
-    let step = PinDriver::output(peripherals.pins.gpio17)?;
-    let mut dir = PinDriver::output(peripherals.pins.gpio18)?;
-    dir.set_low().unwrap();
+    let step = peripherals.pins.gpio17;
+    let dir = peripherals.pins.gpio18;
 
     let clk_config = ledc::config::TimerConfig::new()
         .resolution(Resolution::Bits1)
@@ -291,36 +189,19 @@ fn main() -> anyhow::Result<()> {
     clk_ledc.set_duty(50)?;
     clk_ledc.enable()?;
 
-    //critical_section::with(|cs| {
-    //    CLOCKS.borrow_ref_mut(cs).replace(clocks);
-    //});
-
-    //let clock_cfg = PeripheralClockConfig::with_frequency(&clocks, 625u32.kHz()).unwrap();
-    //let mut mcpwm = MCPWM::new(
-    //    peripherals.MCPWM0,
-    //    clock_cfg,
-    //    &mut system.peripheral_clock_control,
-    //);
-    //// connect operator0 to timer0
-    //mcpwm.operator0.set_timer(&mcpwm.timer0);
-    //// connect operator0 to pin
-    //let mut pwm_pin = mcpwm
-    //    .operator0
-    //    .with_pin_a(step, PwmPinConfig::UP_ACTIVE_HIGH);
-
-    //// start timer with timestamp values in the range of 0..=99 and a frequency of
-    //// 20 kHz
-    //let timer_clock_cfg = clock_cfg
-    //    .timer_clock_with_frequency(1000, PwmWorkingMode::Increase, 255u32.Hz())
-    //    .unwrap();
-    //mcpwm.timer0.start(timer_clock_cfg);
-
     let t0 = std::thread::Builder::new()
         .stack_size(7000)
-        .spawn(move || stepper_task(step, dir))?;
+        .spawn(move || {
+            stepper_task(
+                peripherals.ledc.timer0,
+                peripherals.ledc.channel0,
+                step,
+                dir,
+            )
+        })?;
     let t1 = std::thread::Builder::new()
         .stack_size(7000)
-        .spawn(move || spi_task(cs, driver, en))?;
+        .spawn(move || spi_task(cs, spi_driver, en))?;
 
     //let sys_loop = EspSystemEventLoop::take()?;
     //let nvs = EspDefaultNvsPartition::take()?;
