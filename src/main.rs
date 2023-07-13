@@ -42,14 +42,14 @@ fn stepper_task<
 
     let step_config = ledc::config::TimerConfig::new()
         .resolution(Resolution::Bits8)
-        .frequency(2.kHz().into());
+        .frequency(32.kHz().into());
     let step_timer = Arc::new(LedcTimerDriver::new(ledc_timer, &step_config)?);
     let mut step_ledc = LedcDriver::new(ledc_channel, step_timer, step)?;
     step_ledc.set_duty(50)?;
     step_ledc.enable()?;
 
     loop {
-        FreeRtos::delay_ms(1000);
+        FreeRtos::delay_ms(5000);
 
         moving = !moving;
         if moving {
@@ -134,7 +134,7 @@ fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
     mcu.PWMCONF.set_pwm_meas_sd_enable(true);
     mcu.PWMCONF.set_PWM_FREQ(0);
 
-    mcu.CHOPCONF.set_MRES(4);
+    mcu.CHOPCONF.set_MRES(0);
     mcu.CHOPCONF.set_dedge(true);
     mcu.CHOPCONF.set_intpol(true);
     mcu.CHOPCONF.set_TOFF(3);
