@@ -69,50 +69,6 @@ fn stepper_task<
     }
 }
 
-//fn write_spi<'a, 'b, D: Borrow<SpiDriver<'b>>>(
-//    spi: &'b mut SpiDeviceDriver<'a, D>,
-//) -> impl FnMut(u8, u32) + 'a + 'b {
-//    |addr: u8, val: u32| {
-//        let val_bytes = val.to_be_bytes();
-//        let write: [u8; 5] = [
-//            // set write bit
-//            addr | (TMC_WRITE_BIT as u8),
-//            val_bytes[0],
-//            val_bytes[1],
-//            val_bytes[2],
-//            val_bytes[3],
-//        ];
-//        let mut read = [0; 5];
-//        debug!("writing to spi: {:x?} {:x?}", addr, write);
-//        spi.transfer(&mut read, &write[..])
-//            .expect("Symmetric transfer failed");
-//        debug!("wrote to spi, got {:x?}", read);
-//        let stat = tmc2240::SPI_STATUS::from_bytes([read[0]]);
-//        debug!("spi status: {:#?}", stat);
-//    }
-//}
-//
-//fn read_spi<'a>(spi: &'a mut SpiDeviceDriver<'a, SpiDriver<'a>>) -> impl FnMut(u8) -> u32 + 'a {
-//    |addr: u8| -> u32 {
-//        let mut read = [0u8; 5];
-//        let write = [addr & !TMC_WRITE_BIT as u8, 0, 0, 0, 0];
-//
-//        spi.transfer(&mut read, &write[..])
-//            .expect("Symmetric transfer failed");
-//        debug!("reading from SPI, last response {:x?}", read);
-//        //let stat = tmc2240::SPI_STATUS::from_bytes([write[0]]);
-//        //debug!("spi status: {:#?}", stat);
-//
-//        spi.transfer(&mut read, &write[..])
-//            .expect("Symmetric transfer failed");
-//        debug!("read from SPI, actual response {:x?}", read);
-//        //let stat = tmc2240::SPI_STATUS::from_bytes([write[0]]);
-//        //debug!("spi status: {:#?}", stat);
-//
-//        u32::from_be_bytes([read[1], read[2], read[3], read[4]])
-//    }
-//}
-
 fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
     cs: CS,
     spi_driver: SpiDriver<'a>,
