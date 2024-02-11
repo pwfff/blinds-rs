@@ -1,21 +1,17 @@
 #![feature(type_alias_impl_trait)]
 
-use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
-use esp_idf_svc::{
-    eventloop::EspSystemEventLoop,
-    nvs::EspDefaultNvsPartition,
-    wifi::{BlockingWifi, EspWifi},
-};
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::*;
 
 use core::fmt::Debug;
-use esp_idf_hal::{
+use esp_idf_svc::hal::{
     delay::FreeRtos,
     gpio::{Output, OutputPin, PinDriver},
     ledc::{self, LedcChannel, LedcDriver, LedcTimer, LedcTimerDriver, Resolution},
     peripheral::Peripheral,
     prelude::Peripherals,
     spi::{self, SpiDeviceDriver, SpiDriver, SpiDriverConfig, SPI2},
+    sys::link_patches,
     units::FromValueType,
 };
 use std::{sync::Arc, time::Duration};
@@ -42,7 +38,7 @@ fn stepper_task<
 
     let step_config = ledc::config::TimerConfig::new()
         .resolution(Resolution::Bits8)
-        .frequency(32.kHz().into());
+        .frequency(128.kHz().into());
     let step_timer = Arc::new(LedcTimerDriver::new(ledc_timer, &step_config)?);
     let mut step_ledc = LedcDriver::new(ledc_channel, step_timer, step)?;
     step_ledc.set_duty(50)?;
@@ -56,10 +52,15 @@ fn stepper_task<
             opening = !opening;
         }
 
-        step_ledc.set_duty(match moving {
-            true => 50,
-            false => 0,
-        })?;
+        match moving {
+            true => step_ledc.enable(),
+            false => step_ledc.disable(),
+        }?;
+
+        //step_ledc.set_duty(match moving {
+        //    true => 50,
+        //    false => 0,
+        //})?;
 
         if opening {
             dir.set_low()?;
@@ -123,29 +124,48 @@ fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
 
     let mut mcu = TMC2240::default();
 
-    mcu.IHOLD_IRUN.set_IRUN(31);
-    mcu.IHOLD_IRUN.set_IRUNDELAY(10);
-    mcu.IHOLD_IRUN.set_IHOLDDELAY(10);
-
     mcu.GCONF.set_en_pwm_mode(true);
+
+    mcu.DRV_CONF
+        .set_CURRENT_RANGE(tmc2240::CURRENT_RANGE::THREE_AMP);
 
     mcu.PWMCONF.set_pwm_autoscale(true);
     mcu.PWMCONF.set_pwm_autograd(true);
     mcu.PWMCONF.set_pwm_meas_sd_enable(true);
+    //mcu.PWMCONF.set_pwm_dis_reg_stst(true);
     mcu.PWMCONF.set_PWM_FREQ(0);
+    mcu.PWMCONF.set_FREEWHEEL(1);
 
     mcu.CHOPCONF.set_MRES(0);
-    mcu.CHOPCONF.set_dedge(true);
+    mcu.CHOPCONF.set_dedge(false);
     mcu.CHOPCONF.set_intpol(true);
-    mcu.CHOPCONF.set_TOFF(3);
+    mcu.CHOPCONF.set_TOFF(1);
     mcu.CHOPCONF.set_TBL(2);
-    mcu.CHOPCONF.set_HSTRT_TFD210(4);
-    mcu.CHOPCONF.set_HENDOFFSET(0);
+    mcu.CHOPCONF.set_HSTRT_TFD210(5);
+    mcu.CHOPCONF.set_HENDOFFSET(2);
 
     info!("resetting mcu to: {:#?}", mcu);
     info!("chopconf: {:#?}", mcu.CHOPCONF);
 
     mcu.reset(&mut spi)?;
+
+    mcu.IHOLD_IRUN.set_IRUN(31);
+    mcu.IHOLD_IRUN.set_IHOLD(0);
+    mcu.IHOLD_IRUN.set_IRUNDELAY(4);
+    mcu.IHOLD_IRUN.set_IHOLDDELAY(1);
+    mcu.IHOLD_IRUN.write(&mut spi)?;
+
+    mcu.TPOWERDOWN.set_TPOWERDOWN(10);
+    mcu.TPOWERDOWN.write(&mut spi)?;
+
+    mcu.SG4_THRS.set_SG4_THRS(1);
+    mcu.SG4_THRS.write(&mut spi)?;
+
+    //mcu.COOLCONF.set_sgt(0b1000000u8 | 10);
+    //mcu.COOLCONF.write(&mut spi)?;
+
+    mcu.TCOOLTHRS.set_TCOOLTHRS(300);
+    mcu.TCOOLTHRS.write(&mut spi)?;
 
     let got_chop = mcu.CHOPCONF.read(&mut spi).expect("couldn't read");
     info!("reading back chopconf: {:#?}", got_chop);
@@ -156,12 +176,27 @@ fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
         FreeRtos::delay_ms(1_000);
 
         let stat = mcu.DRVSTATUS.read(&mut spi);
-        info!("drv status: {:#?}", stat);
+        info!("drv status: {:#?}", stat.unwrap());
+
+        let stat = mcu.TSTEP.read(&mut spi);
+        info!("tstep: {:#?}", stat.unwrap());
+
+        let stat = mcu.TCOOLTHRS.read(&mut spi);
+        info!("tcool: {:#?}", stat.unwrap());
+
+        let stat = mcu.TPWMTHRS.read(&mut spi);
+        info!("tpwm: {:#?}", stat.unwrap());
+
+        let stat = mcu.SG4_RESULT.read(&mut spi);
+        info!("sg4 result: {:#?}", stat.unwrap());
+
+        //let mscnt = mcu.MSCNT.read(&mut spi);
+        //info!("mscnt: {:#?}", mscnt);
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    esp_idf_sys::link_patches();
+    link_patches();
 
     esp_idf_svc::log::EspLogger::initialize_default();
 
@@ -257,10 +292,10 @@ const PASSWORD: &str = env!("WIFI_PASS");
 
 fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> anyhow::Result<()> {
     let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
-        ssid: SSID.into(),
+        ssid: SSID.try_into().unwrap(),
         bssid: None,
         auth_method: AuthMethod::WPA2Personal,
-        password: PASSWORD.into(),
+        password: PASSWORD.try_into().unwrap(),
         channel: None,
     });
 
