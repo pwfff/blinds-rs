@@ -1,314 +1,156 @@
-#![feature(type_alias_impl_trait)]
+mod motor;
 
-use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
-use log::*;
-
-use core::fmt::Debug;
+use anyhow::{bail, ensure, Context};
 use esp_idf_svc::hal::{
     delay::FreeRtos,
-    gpio::{Output, OutputPin, PinDriver},
-    ledc::{self, LedcChannel, LedcDriver, LedcTimer, LedcTimerDriver, Resolution},
-    peripheral::Peripheral,
-    prelude::Peripherals,
+    gpio::PinDriver,
+    ledc::{self, LedcDriver, LedcTimerDriver, Resolution},
+    peripherals::Peripherals,
     spi::{self, SpiDeviceDriver, SpiDriver, SpiDriverConfig, SPI2},
     sys::link_patches,
     units::FromValueType,
 };
-use std::{sync::Arc, time::Duration};
+use log::*;
+use std::sync::Arc;
+use tmc_rs::registers::{tmc2240, Register};
 
-use tmc_rs::registers::{tmc2240::TMC2240, *};
-
-fn stepper_task<
-    'a,
-    STEP: Peripheral<P = impl OutputPin>,
-    DIR: Peripheral<P = impl OutputPin>,
-    T: Peripheral<P = impl LedcTimer>,
-    C: Peripheral<P = impl LedcChannel>,
->(
-    ledc_timer: T,
-    ledc_channel: C,
-    step: STEP,
-    dir: DIR,
-) -> anyhow::Result<()> {
-    let mut moving = true;
-    let mut opening = false;
-
-    let mut dir = PinDriver::output(dir)?;
-    dir.set_low().unwrap();
-
-    let step_config = ledc::config::TimerConfig::new()
-        .resolution(Resolution::Bits8)
-        .frequency(128.kHz().into());
-    let step_timer = Arc::new(LedcTimerDriver::new(ledc_timer, &step_config)?);
-    let mut step_ledc = LedcDriver::new(ledc_channel, step_timer, step)?;
-    step_ledc.set_duty(50)?;
-    step_ledc.enable()?;
-
-    loop {
-        FreeRtos::delay_ms(5000);
-
-        moving = !moving;
-        if moving {
-            opening = !opening;
-        }
-
-        match moving {
-            true => step_ledc.enable(),
-            false => step_ledc.disable(),
-        }?;
-
-        //step_ledc.set_duty(match moving {
-        //    true => 50,
-        //    false => 0,
-        //})?;
-
-        if opening {
-            dir.set_low()?;
-        } else {
-            dir.set_high()?;
-        }
+fn check_driver_status(status: tmc2240::DRV_STATUS) -> anyhow::Result<()> {
+    let flags = status.SPI_STATUS();
+    if flags.ot() || flags.otpw() || flags.s2ga() || flags.s2gb() {
+        bail!("driver temperature/short-circuit fault: {status:#?}");
     }
-}
-
-//fn write_spi<'a, 'b, D: Borrow<SpiDriver<'b>>>(
-//    spi: &'b mut SpiDeviceDriver<'a, D>,
-//) -> impl FnMut(u8, u32) + 'a + 'b {
-//    |addr: u8, val: u32| {
-//        let val_bytes = val.to_be_bytes();
-//        let write: [u8; 5] = [
-//            // set write bit
-//            addr | (TMC_WRITE_BIT as u8),
-//            val_bytes[0],
-//            val_bytes[1],
-//            val_bytes[2],
-//            val_bytes[3],
-//        ];
-//        let mut read = [0; 5];
-//        debug!("writing to spi: {:x?} {:x?}", addr, write);
-//        spi.transfer(&mut read, &write[..])
-//            .expect("Symmetric transfer failed");
-//        debug!("wrote to spi, got {:x?}", read);
-//        let stat = tmc2240::SPI_STATUS::from_bytes([read[0]]);
-//        debug!("spi status: {:#?}", stat);
-//    }
-//}
-//
-//fn read_spi<'a>(spi: &'a mut SpiDeviceDriver<'a, SpiDriver<'a>>) -> impl FnMut(u8) -> u32 + 'a {
-//    |addr: u8| -> u32 {
-//        let mut read = [0u8; 5];
-//        let write = [addr & !TMC_WRITE_BIT as u8, 0, 0, 0, 0];
-//
-//        spi.transfer(&mut read, &write[..])
-//            .expect("Symmetric transfer failed");
-//        debug!("reading from SPI, last response {:x?}", read);
-//        //let stat = tmc2240::SPI_STATUS::from_bytes([write[0]]);
-//        //debug!("spi status: {:#?}", stat);
-//
-//        spi.transfer(&mut read, &write[..])
-//            .expect("Symmetric transfer failed");
-//        debug!("read from SPI, actual response {:x?}", read);
-//        //let stat = tmc2240::SPI_STATUS::from_bytes([write[0]]);
-//        //debug!("spi status: {:#?}", stat);
-//
-//        u32::from_be_bytes([read[1], read[2], read[3], read[4]])
-//    }
-//}
-
-fn spi_task<'a, CS: Peripheral<P = CSP>, CSP: OutputPin, EN: OutputPin>(
-    cs: CS,
-    spi_driver: SpiDriver<'a>,
-    mut en: PinDriver<'a, EN, Output>,
-) -> anyhow::Result<()> {
-    let spi_config = spi::config::Config::new().baudrate(5.MHz().into());
-    let mut spi = SpiDeviceDriver::new(&spi_driver, Some(cs), &spi_config)?;
-
-    let mut mcu = TMC2240::default();
-
-    mcu.GCONF.set_en_pwm_mode(true);
-
-    mcu.DRV_CONF
-        .set_CURRENT_RANGE(tmc2240::CURRENT_RANGE::THREE_AMP);
-
-    mcu.PWMCONF.set_pwm_autoscale(true);
-    mcu.PWMCONF.set_pwm_autograd(true);
-    mcu.PWMCONF.set_pwm_meas_sd_enable(true);
-    //mcu.PWMCONF.set_pwm_dis_reg_stst(true);
-    mcu.PWMCONF.set_PWM_FREQ(0);
-    mcu.PWMCONF.set_FREEWHEEL(1);
-
-    mcu.CHOPCONF.set_MRES(0);
-    mcu.CHOPCONF.set_dedge(false);
-    mcu.CHOPCONF.set_intpol(true);
-    mcu.CHOPCONF.set_TOFF(1);
-    mcu.CHOPCONF.set_TBL(2);
-    mcu.CHOPCONF.set_HSTRT_TFD210(5);
-    mcu.CHOPCONF.set_HENDOFFSET(2);
-
-    info!("resetting mcu to: {:#?}", mcu);
-    info!("chopconf: {:#?}", mcu.CHOPCONF);
-
-    mcu.reset(&mut spi)?;
-
-    mcu.IHOLD_IRUN.set_IRUN(31);
-    mcu.IHOLD_IRUN.set_IHOLD(0);
-    mcu.IHOLD_IRUN.set_IRUNDELAY(4);
-    mcu.IHOLD_IRUN.set_IHOLDDELAY(1);
-    mcu.IHOLD_IRUN.write(&mut spi)?;
-
-    mcu.TPOWERDOWN.set_TPOWERDOWN(10);
-    mcu.TPOWERDOWN.write(&mut spi)?;
-
-    mcu.SG4_THRS.set_SG4_THRS(1);
-    mcu.SG4_THRS.write(&mut spi)?;
-
-    //mcu.COOLCONF.set_sgt(0b1000000u8 | 10);
-    //mcu.COOLCONF.write(&mut spi)?;
-
-    mcu.TCOOLTHRS.set_TCOOLTHRS(300);
-    mcu.TCOOLTHRS.write(&mut spi)?;
-
-    let got_chop = mcu.CHOPCONF.read(&mut spi).expect("couldn't read");
-    info!("reading back chopconf: {:#?}", got_chop);
-
-    en.set_low().unwrap();
-
-    loop {
-        FreeRtos::delay_ms(1_000);
-
-        let stat = mcu.DRVSTATUS.read(&mut spi);
-        info!("drv status: {:#?}", stat.unwrap());
-
-        let stat = mcu.TSTEP.read(&mut spi);
-        info!("tstep: {:#?}", stat.unwrap());
-
-        let stat = mcu.TCOOLTHRS.read(&mut spi);
-        info!("tcool: {:#?}", stat.unwrap());
-
-        let stat = mcu.TPWMTHRS.read(&mut spi);
-        info!("tpwm: {:#?}", stat.unwrap());
-
-        let stat = mcu.SG4_RESULT.read(&mut spi);
-        info!("sg4 result: {:#?}", stat.unwrap());
-
-        //let mscnt = mcu.MSCNT.read(&mut spi);
-        //info!("mscnt: {:#?}", mscnt);
-    }
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
     link_patches();
-
     esp_idf_svc::log::EspLogger::initialize_default();
+    let peripherals = Peripherals::take()?;
 
-    let peripherals = Peripherals::take().unwrap();
-
-    let mosi = peripherals.pins.gpio4;
-    let sclk = peripherals.pins.gpio5;
-    let cs = peripherals.pins.gpio6;
-    let miso = peripherals.pins.gpio7;
+    // DRV_ENN is active low. Keep it disabled throughout setup and on any error.
+    // A board pull-up is still required to keep it disabled during reset/boot.
     let mut en = PinDriver::output(peripherals.pins.gpio15)?;
-    en.set_high().log().unwrap();
+    en.set_high()?;
+    FreeRtos::delay_ms(1); // allow bridge disable before any configuration writes
 
-    let spi = peripherals.spi2;
-    let spi_driver = SpiDriver::new::<SPI2>(spi, sclk, mosi, Some(miso), &SpiDriverConfig::new())?;
-
-    let clk = peripherals.pins.gpio16;
-    let step = peripherals.pins.gpio17;
-    let dir = peripherals.pins.gpio18;
-
+    // Keep the clock and PWM handles alive even after a fault; dropping EN must
+    // not be our shutdown mechanism. The outer scope parks with EN driven high.
     let clk_config = ledc::config::TimerConfig::new()
         .resolution(Resolution::Bits1)
-        .frequency(16.MHz().into());
+        .frequency(motor::CLOCK_HZ.Hz());
     let clk_timer = Arc::new(LedcTimerDriver::new(peripherals.ledc.timer1, &clk_config)?);
-    let mut clk_ledc = LedcDriver::new(peripherals.ledc.channel1, clk_timer, clk)?;
-    clk_ledc.set_duty(50)?;
+    let mut clk_ledc = LedcDriver::new(
+        peripherals.ledc.channel1,
+        clk_timer,
+        peripherals.pins.gpio16,
+    )?;
+    // One bit has two ticks: duty=1 is 50%, not duty=50.
+    clk_ledc.set_duty(1)?;
     clk_ledc.enable()?;
+    FreeRtos::delay_ms(1);
 
-    let t0 = std::thread::Builder::new()
-        .stack_size(7000)
-        .spawn(move || {
-            stepper_task(
-                peripherals.ledc.timer0,
-                peripherals.ledc.channel0,
-                step,
-                dir,
-            )
-        })?;
-    let t1 = std::thread::Builder::new()
-        .stack_size(7000)
-        .spawn(move || spi_task(cs, spi_driver, en))?;
+    let step_config = ledc::config::TimerConfig::new()
+        .resolution(Resolution::Bits8)
+        .frequency(motor::STEP_HZ.Hz());
+    let step_timer = Arc::new(LedcTimerDriver::new(peripherals.ledc.timer0, &step_config)?);
+    let mut step_ledc = LedcDriver::new(
+        peripherals.ledc.channel0,
+        step_timer,
+        peripherals.pins.gpio17,
+    )?;
+    step_ledc.disable()?;
+    let mut dir = PinDriver::output(peripherals.pins.gpio18)?;
+    dir.set_low()?;
 
-    //let sys_loop = EspSystemEventLoop::take()?;
-    //let nvs = EspDefaultNvsPartition::take()?;
+    let spi_driver = SpiDriver::new::<SPI2>(
+        peripherals.spi2,
+        peripherals.pins.gpio5,
+        peripherals.pins.gpio4,
+        Some(peripherals.pins.gpio7),
+        &SpiDriverConfig::new(),
+    )?;
+    let spi_config = spi::config::Config::new()
+        .baudrate(5.MHz().into())
+        .data_mode(spi::config::MODE_3);
+    let mut spi = SpiDeviceDriver::new(&spi_driver, Some(peripherals.pins.gpio6), &spi_config)?;
+    let mut registers = tmc2240::TMC2240::default();
 
-    //let mut wifi = BlockingWifi::wrap(
-    //    EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
-    //    sys_loop,
-    //)?;
-    //connect_wifi(&mut wifi)?;
+    let result = (|| -> anyhow::Result<()> {
+        info!(
+            "nominal current: max {:?}, run {:?}, hold {:?}",
+            motor::CURRENT.max_rms(),
+            motor::CURRENT.run_rms(),
+            motor::CURRENT.hold_rms()
+        );
+        motor::MOTOR
+            .stage(&mut registers)
+            .write(&mut spi)
+            .context("writing checked motor profile")?;
+        // Associated reads do not overwrite the staged configuration cache.
+        let observed = tmc2240::CHOPCONF::read_at(&mut spi)?;
+        ensure!(observed == registers.CHOPCONF, "CHOPCONF readback mismatch");
+        info!("chopconf: {observed:#?}");
 
-    info!("Waiting for PWM threads");
+        check_driver_status(registers.DRVSTATUS.read(&mut spi)?)?;
+        en.set_low()?;
+        FreeRtos::delay_ms(1);
+        step_ledc.set_duty(128)?; // 50% of the 256-tick STEP period
+        step_ledc.enable()?;
+        let mut moving = true;
+        let mut opening = true; // low DIR, matching the initial pin state
+        let mut seconds = 0;
+        loop {
+            FreeRtos::delay_ms(1_000);
+            let status = registers.DRVSTATUS.read(&mut spi)?;
+            info!("drv status: {status:#?}");
+            check_driver_status(status)?;
+            info!("tstep: {:#?}", registers.TSTEP.read(&mut spi)?);
+            if !moving {
+                info!(
+                    "holding: dir={}, mscnt={}",
+                    if opening { "low" } else { "high" },
+                    registers.MSCNT.read(&mut spi)?.MSCNT()
+                );
+            }
+            seconds += 1;
+            if seconds == 5 {
+                seconds = 0;
+                if moving {
+                    step_ledc.disable()?;
+                    // Let the PWM duty update settle before sampling the stop position.
+                    FreeRtos::delay_ms(1);
+                    info!(
+                        "stopped: dir={}, mscnt={}",
+                        if opening { "low" } else { "high" },
+                        registers.MSCNT.read(&mut spi)?.MSCNT()
+                    );
+                } else {
+                    opening = !opening;
+                    if opening {
+                        dir.set_low()?;
+                    } else {
+                        dir.set_high()?;
+                    }
+                    // Change DIR only while STEP is stopped; exceed its setup time.
+                    FreeRtos::delay_ms(1);
+                    step_ledc.enable()?;
+                }
+                moving = !moving;
+            }
+        }
+    })();
 
-    println!("Joined PWM threads");
-
-    println!("Done");
-
+    // Disable the bridge first, even if stopping STEP also fails.
+    if let Err(error) = en.set_high() {
+        error!("could not disable driver: {error}");
+    }
+    if let Err(error) = step_ledc.disable() {
+        error!("could not stop STEP: {error}");
+    }
+    if let Err(error) = result {
+        error!("motor stopped: {error:#}");
+    }
     loop {
-        // Don't let the idle task starve and trigger warnings from the watchdog.
-        //FreeRtos::delay_ms(1_000);
-        std::thread::sleep(Duration::from_millis(100));
+        FreeRtos::delay_ms(1_000);
     }
-}
-
-struct Bytes<'a>(&'a [u8]);
-
-impl<'a> core::fmt::Binary for Bytes<'a> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "[")?;
-        for byte in self.0 {
-            core::fmt::Binary::fmt(byte, f)?;
-            writeln!(f, ",")?;
-        }
-        writeln!(f, "]")?;
-        Ok(())
-    }
-}
-
-trait LogExt {
-    fn log(self) -> Self;
-}
-
-impl<T, E: Debug> LogExt for Result<T, E> {
-    fn log(self) -> Self {
-        if let Err(e) = &self {
-            error!("An error happened: {:?}", e);
-        }
-        self
-    }
-}
-
-const SSID: &str = env!("WIFI_SSID");
-const PASSWORD: &str = env!("WIFI_PASS");
-
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> anyhow::Result<()> {
-    let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
-        ssid: SSID.try_into().unwrap(),
-        bssid: None,
-        auth_method: AuthMethod::WPA2Personal,
-        password: PASSWORD.try_into().unwrap(),
-        channel: None,
-    });
-
-    wifi.set_configuration(&wifi_configuration)?;
-
-    wifi.start()?;
-    info!("Wifi started");
-
-    wifi.connect()?;
-    info!("Wifi connected");
-
-    wifi.wait_netif_up()?;
-    info!("Wifi netif up");
-
-    Ok(())
 }
